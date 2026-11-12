@@ -32,12 +32,20 @@ def update_folder_names_and_paths(key, targets=[]):
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 
-class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
+class GGUFModelPatcher(comfy.model_patcher.CoreModelPatcher):
     patch_on_device = False
 
-    def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
+    def patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
         if key not in self.patches:
-            return
+            if force_cast:
+                return super().patch_weight_to_device(
+                    key,
+                    device_to=device_to,
+                    inplace_update=inplace_update,
+                    return_weight=return_weight,
+                    force_cast=force_cast,
+                )
+            return comfy.utils.get_attr(self.model, key)
         weight = comfy.utils.get_attr(self.model, key)
 
         patches = self.patches[key]
@@ -78,56 +86,15 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
 
 
-    def pin_weight_to_device(self, key):
-        op_key = key.rsplit('.', 1)[0]
-        if not self.mmap_released and op_key in self.named_modules_to_munmap:
-            # TODO: possible to OOM, find better way to detach
-            self.named_modules_to_munmap[op_key].to(self.load_device).to(self.offload_device)
-            del self.named_modules_to_munmap[op_key]
-        super().pin_weight_to_device(key)
-
-    mmap_released = False
-    named_modules_to_munmap = {}
-
-    def load(self, *args, force_patch_weights=False, **kwargs):
-        if not self.mmap_released:
-            self.named_modules_to_munmap = dict(self.model.named_modules())
-
-        # always call `patch_weight_to_device` even for lowvram
-        super().load(*args, force_patch_weights=True, **kwargs)
-
-        # make sure nothing stays linked to mmap after first load
-        if not self.mmap_released:
-            linked = []
-            if kwargs.get("lowvram_model_memory", 0) > 0:
-                for n, m in self.named_modules_to_munmap.items():
-                    if hasattr(m, "weight"):
-                        device = getattr(m.weight, "device", None)
-                        if device == self.offload_device:
-                            linked.append((n, m))
-                            continue
-                    if hasattr(m, "bias"):
-                        device = getattr(m.bias, "device", None)
-                        if device == self.offload_device:
-                            linked.append((n, m))
-                            continue
-            if linked and self.load_device != self.offload_device:
-                logging.info(f"Attempting to release mmap ({len(linked)})")
-                for n, m in linked:
-                    # TODO: possible to OOM, find better way to detach
-                    m.to(self.load_device).to(self.offload_device)
-            self.mmap_released = True
-            self.named_modules_to_munmap = {}
-
     def clone(self, *args, **kwargs):
         src_cls = self.__class__
         self.__class__ = GGUFModelPatcher
-        n = super().clone(*args, **kwargs)
-        n.__class__ = GGUFModelPatcher
-        self.__class__ = src_cls
+        try:
+            n = super().clone(*args, **kwargs)
+        finally:
+            self.__class__ = src_cls
         # GGUF specific clone values below
         n.patch_on_device = getattr(self, "patch_on_device", False)
-        n.mmap_released = getattr(self, "mmap_released", False)
         if src_cls != GGUFModelPatcher:
             n.size = 0 # force recalc
         return n

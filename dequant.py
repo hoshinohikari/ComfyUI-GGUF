@@ -1,18 +1,33 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import gguf
 import torch
+import dataclasses
 from tqdm import tqdm
+from comfy.quant_ops import QuantizedTensor
 
 
 TORCH_COMPATIBLE_QTYPES = (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
+GGUF_QUANTIZED_LAYOUT = "ComfyUI-GGUF"
 
 def is_torch_compatible(tensor):
+    if isinstance(tensor, QuantizedTensor):
+        return False
     return tensor is None or getattr(tensor, "tensor_type", None) in TORCH_COMPATIBLE_QTYPES
 
 def is_quantized(tensor):
     return not is_torch_compatible(tensor)
 
 def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
+    if isinstance(tensor, QuantizedTensor):
+        if getattr(tensor, "_layout_cls", None) == GGUF_QUANTIZED_LAYOUT:
+            if dequant_dtype is not None:
+                params = dataclasses.replace(tensor._params, dequant_dtype=dequant_dtype)
+                tensor = tensor._copy_with(params=params, clone_params=False)
+            if dequant_dtype == "target" and dtype is not None:
+                tensor = tensor.to(dtype=dtype)
+        result = tensor.dequantize()
+        return result.to(dtype) if dtype is not None else result
+
     qtype = getattr(tensor, "tensor_type", None)
     oshape = getattr(tensor, "tensor_shape", tensor.shape)
 

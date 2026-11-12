@@ -5,6 +5,11 @@ import torch
 import gguf
 import re
 import os
+import ctypes
+import threading
+
+import comfy.memory_management
+import comfy.storage
 
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
@@ -113,17 +118,38 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     if compat:
         logging.warning(f"Warning: This gguf model file is loaded in compatibility mode '{compat}' [arch:{arch_str}]")
 
+    # Use the same file-backed storage contract as ComfyUI's native loader.
+    # This lets DynamicVRAM read compressed bytes without retaining a second
+    # complete CPU weight cache on fast storage.
+    import comfy_aimdo.model_mmap
+
+    model_mmap = comfy_aimdo.model_mmap.ModelMMAP(path)
+    file_ref = model_mmap.get_file_handle()
+    file_lock = threading.Lock()
+    file_size = os.path.getsize(path)
+    mapped_bytes = memoryview((ctypes.c_uint8 * file_size).from_address(model_mmap.get()))
+
     # main loading loop
     state_dict = {}
     qtype_dict = {}
     for sd_key, tensor in tensors:
         tensor_name = tensor.name
-        # torch_tensor = torch.from_numpy(tensor.data) # mmap
-
-        # NOTE: line above replaced with this block to avoid persistent numpy warning about mmap
+        start = int(tensor.data_offset)
+        size = int(tensor.n_bytes)
+        if start < 0 or start + size > file_size:
+            raise ValueError(f"GGUF tensor {tensor_name!r} extends past the end of the file")
         with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
-            torch_tensor = torch.from_numpy(tensor.data) # mmap
+            warnings.filterwarnings("ignore", message="The given.*not writable")
+            dtype = torch.from_numpy(tensor.data).dtype
+            if size:
+                torch_tensor = torch.frombuffer(mapped_bytes[start:start + size], dtype=dtype).reshape(tensor.data.shape)
+                storage = torch_tensor.untyped_storage()
+                storage._comfy_tensor_file_slice = comfy.memory_management.TensorFileSlice(
+                    file_ref, file_lock, start, size,
+                )
+                storage._comfy_tensor_mmap_refs = (model_mmap, mapped_bytes)
+            else:
+                torch_tensor = torch.empty(tensor.data.shape, dtype=dtype)
 
         shape = get_orig_shape(reader, tensor_name)
         if shape is None:
@@ -147,6 +173,8 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
         qtype_dict[tensor_type_str] = qtype_dict.get(tensor_type_str, 0) + 1
+
+    comfy.storage.annotate_state_dict(state_dict, path)
 
     # print loaded tensor type counts
     logging.info("gguf qtypes: " + ", ".join(f"{k} ({v})" for k, v in qtype_dict.items()))
@@ -500,9 +528,6 @@ def gguf_clip_loader(path):
         if temb_key in sd and sd[temb_key].shape == (256384, 4096):
             # non-standard Comfy-Org tokenizer
             sd["spiece_model"] = gguf_tokenizer_loader(path, sd[temb_key].shape)
-            # TODO: dequantizing token embed here is janky but otherwise we OOM due to tensor being massive.
-            logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
-            sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         sd = sd_map_replace(sd, T5_SD_MAP)
     elif arch in {"llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}:
         # TODO: pass model_options["vocab_size"] to loader somehow
@@ -513,9 +538,6 @@ def gguf_clip_loader(path):
                 sd["tekken_model"] = gguf_tekken_tokenizer_loader(path, sd[temb_key].shape)
             elif arch == "gemma3":
                 sd["spiece_model"] = gguf_gemma3_tokenizer_loader(path)
-            # See note above for T5.
-            logging.warning(f"Dequantizing {temb_key} to prevent runtime OOM.")
-            sd[temb_key] = dequantize_tensor(sd[temb_key], dtype=torch.float16)
         if arch == "gemma3":
             sd = sd_map_replace(sd, GEMMA3_SD_MAP)
             sd = gemma3_norm_corrections(sd)

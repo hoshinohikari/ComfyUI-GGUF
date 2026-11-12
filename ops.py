@@ -1,12 +1,16 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import contextlib
 import gguf
 import torch
 import logging
+from dataclasses import dataclass
 
 import comfy.ops
 import comfy.lora
 import comfy.model_management
-from .dequant import dequantize_tensor, is_quantized
+from comfy.quant_ops import QuantizedTensor
+from comfy_kitchen.tensor import QuantizedLayout, register_layout_class
+from .dequant import GGUF_QUANTIZED_LAYOUT, dequantize, dequantize_tensor, is_quantized
 
 def chained_hasattr(obj, chained_attr):
     probe = obj
@@ -40,6 +44,82 @@ def get_torch_compiler_disable_decorator():
         return torch.compiler.disable
 
 torch_compiler_disable = get_torch_compiler_disable_decorator()
+
+
+class GGUFQuantizedLayout(QuantizedLayout):
+    @dataclass(frozen=True)
+    class Params:
+        orig_dtype: torch.dtype
+        orig_shape: tuple[int, ...]
+        qtype: gguf.GGMLQuantizationType
+        dequant_dtype: torch.dtype | str | None = None
+
+        def to_device(self, device):
+            return self
+
+        def clone(self):
+            return self
+
+        def copy_from(self, src, non_blocking=False):
+            if self.orig_shape != src.orig_shape or self.qtype != src.qtype:
+                raise ValueError("Cannot copy between GGUF tensors with different shapes or quantization types")
+
+    @classmethod
+    def quantize(cls, tensor, **kwargs):
+        raise NotImplementedError("GGUF weights are wrapped without requantization")
+
+    @classmethod
+    def dequantize(cls, qdata, params):
+        dtype = params.orig_dtype if params.dequant_dtype == "target" else params.dequant_dtype
+        result = dequantize(qdata, params.qtype, params.orig_shape, dtype=dtype)
+        return result.to(params.orig_dtype)
+
+    @classmethod
+    def get_plain_tensors(cls, qtensor):
+        return (qtensor._qdata,)
+
+    @classmethod
+    def state_dict_tensors(cls, qdata, params):
+        return {"weight": qdata}
+
+    @classmethod
+    def dequantize_embedding(cls, qtensor, indices, out_dtype=None):
+        params = qtensor._params
+        vocab_size, embedding_dim = params.orig_shape
+        block_size, type_size = gguf.GGML_QUANT_SIZES[params.qtype]
+        if embedding_dim % block_size != 0:
+            raise ValueError(f"GGUF embedding row size {embedding_dim} is not aligned to {block_size}")
+
+        row_size = embedding_dim // block_size * type_size
+        qdata = qtensor._qdata.reshape(-1).view(torch.uint8)
+        rows = qdata.reshape(vocab_size, row_size)
+        row_indices = indices.reshape(-1).to(device=qdata.device, dtype=torch.long)
+        selected = rows.index_select(0, row_indices)
+        if selected.device != indices.device:
+            selected = selected.to(indices.device, non_blocking=True)
+
+        dtype = params.orig_dtype if params.dequant_dtype == "target" else params.dequant_dtype
+        result = dequantize(selected, params.qtype, (row_indices.numel(), embedding_dim), dtype=dtype)
+        result = result.to(params.orig_dtype).reshape(*indices.shape, embedding_dim)
+        return result.to(dtype=out_dtype) if out_dtype is not None else result
+
+
+register_layout_class(GGUF_QUANTIZED_LAYOUT, GGUFQuantizedLayout)
+
+
+def is_gguf_quantized_tensor(tensor):
+    return isinstance(tensor, QuantizedTensor) and tensor._layout_cls == GGUF_QUANTIZED_LAYOUT
+
+
+def make_gguf_quantized_tensor(tensor, dtype, dequant_dtype=None):
+    qdata = tensor.as_subclass(torch.Tensor)
+    params = GGUFQuantizedLayout.Params(
+        orig_dtype=dtype,
+        orig_shape=tuple(tensor.tensor_shape),
+        qtype=tensor.tensor_type,
+        dequant_dtype=dequant_dtype,
+    )
+    return QuantizedTensor(qdata, GGUF_QUANTIZED_LAYOUT, params)
 
 class GGMLTensor(torch.Tensor):
     """
@@ -121,8 +201,14 @@ class GGMLLayer(torch.nn.Module):
         prefix_len = len(prefix)
         for k,v in state_dict.items():
             if k[prefix_len:] == "weight":
+                if isinstance(v, GGMLTensor) and is_quantized(v):
+                    dtype = getattr(self, "weight_comfy_model_dtype", None) or torch.float16
+                    v = make_gguf_quantized_tensor(v, dtype, self.dequant_dtype)
                 self.weight = torch.nn.Parameter(v, requires_grad=False)
             elif k[prefix_len:] == "bias" and v is not None:
+                if isinstance(v, GGMLTensor) and is_quantized(v):
+                    dtype = getattr(self, "bias_comfy_model_dtype", None) or torch.float16
+                    v = make_gguf_quantized_tensor(v, dtype, self.dequant_dtype)
                 self.bias = torch.nn.Parameter(v, requires_grad=False)
             else:
                 unexpected_keys.append(k)
@@ -144,7 +230,10 @@ class GGMLLayer(torch.nn.Module):
 
     def ggml_save_to_state_dict(self, destination, prefix, keep_vars):
         # This is a fake state dict for vram estimation
-        weight = torch.zeros_like(self.weight, device=torch.device("meta"))
+        if is_gguf_quantized_tensor(self.weight):
+            weight = torch.empty(self.weight.shape, device=torch.device("meta"), dtype=self.weight.dtype)
+        else:
+            weight = torch.zeros_like(self.weight, device=torch.device("meta"))
         destination[prefix + "weight"] = weight
         if self.bias is not None:
             bias = torch.zeros_like(self.bias, device=torch.device("meta"))
@@ -199,22 +288,43 @@ class GGMLLayer(torch.nn.Module):
                 bias_dtype = dtype
             if device is None:
                 device = input.device
+        if dtype is None:
+            dtype = getattr(s, "weight_comfy_model_dtype", None) or s.weight.dtype
+        if bias_dtype is None:
+            bias_dtype = dtype
+        if device is None:
+            device = s.weight.device
 
-        bias = None
-        non_blocking = comfy.model_management.device_supports_non_blocking(device)
-        if s.bias is not None:
-            bias = s.get_weight(s.bias.to(device), dtype)
-            bias = comfy.ops.cast_to(bias, bias_dtype, device, non_blocking=non_blocking, copy=False)
+        cast_dtype = s.weight.dtype if is_gguf_quantized_tensor(s.weight) else dtype
+        weight, bias, offload_state = comfy.ops.cast_bias_weight(
+            s,
+            input=input,
+            dtype=cast_dtype,
+            device=device,
+            bias_dtype=bias_dtype,
+            offloadable=True,
+        )
+        try:
+            weight = s.get_weight(weight, dtype)
+            bias = s.get_weight(bias, bias_dtype)
+        except Exception:
+            comfy.ops.uncast_bias_weight(s, weight, bias, offload_state)
+            raise
+        return weight, bias, offload_state
 
-        weight = s.get_weight(s.weight.to(device), dtype)
-        weight = comfy.ops.cast_to(weight, dtype, device, non_blocking=non_blocking, copy=False)
-        return weight, bias
+    @contextlib.contextmanager
+    def cast_bias_weight_context(s, *args, **kwargs):
+        weight, bias, offload_state = s.cast_bias_weight(*args, **kwargs)
+        try:
+            yield weight, bias
+        finally:
+            comfy.ops.uncast_bias_weight(s, weight, bias, offload_state)
 
     def forward_comfy_cast_weights(self, input, *args, **kwargs):
-        if self.is_ggml_quantized():
-            out = self.forward_ggml_cast_weights(input, *args, **kwargs)
-        else:
+        if self.weight is None:
             out = super().forward_comfy_cast_weights(input, *args, **kwargs)
+        else:
+            out = self.forward_ggml_cast_weights(input, *args, **kwargs)
 
         # non-ggml forward might still propagate custom tensor class
         if isinstance(out, GGMLTensor):
@@ -238,37 +348,49 @@ class GGMLOps(comfy.ops.manual_cast):
             self.out_features = out_features
             self.weight = None
             self.bias = None
+            self.weight_function = []
+            self.bias_function = []
+            self.weight_comfy_model_dtype = dtype
+            self.bias_comfy_model_dtype = dtype
 
         def forward_ggml_cast_weights(self, input):
-            weight, bias = self.cast_bias_weight(input)
-            return torch.nn.functional.linear(input, weight, bias)
+            with self.cast_bias_weight_context(input) as (weight, bias):
+                return torch.nn.functional.linear(input, weight, bias)
 
     class Conv2d(GGMLLayer, comfy.ops.manual_cast.Conv2d):
         def forward_ggml_cast_weights(self, input):
-            weight, bias = self.cast_bias_weight(input)
-            return self._conv_forward(input, weight, bias)
+            with self.cast_bias_weight_context(input) as (weight, bias):
+                return self._conv_forward(input, weight, bias)
 
     class Embedding(GGMLLayer, comfy.ops.manual_cast.Embedding):
+        def host_rows(self, input, out_dtype=None):
+            if is_gguf_quantized_tensor(self.weight):
+                return GGUFQuantizedLayout.dequantize_embedding(self.weight, input, out_dtype)
+            return super().host_rows(input, out_dtype=out_dtype)
+
         def forward_ggml_cast_weights(self, input, out_dtype=None):
             output_dtype = out_dtype
             if self.weight.dtype == torch.float16 or self.weight.dtype == torch.bfloat16:
                 out_dtype = None
-            weight, _bias = self.cast_bias_weight(self, device=input.device, dtype=out_dtype)
-            return torch.nn.functional.embedding(
-                input, weight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse
-            ).to(dtype=output_dtype)
+            if (is_gguf_quantized_tensor(self.weight) and self.max_norm is None
+                    and not getattr(self, "weight_function", []) and not hasattr(self, "_prefetch")):
+                return self.host_rows(input, out_dtype=output_dtype)
+            with self.cast_bias_weight_context(device=input.device, dtype=out_dtype) as (weight, _bias):
+                return torch.nn.functional.embedding(
+                    input, weight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse
+                ).to(dtype=output_dtype)
 
     class LayerNorm(GGMLLayer, comfy.ops.manual_cast.LayerNorm):
         def forward_ggml_cast_weights(self, input):
             if self.weight is None:
                 return super().forward_comfy_cast_weights(input)
-            weight, bias = self.cast_bias_weight(input)
-            return torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
+            with self.cast_bias_weight_context(input) as (weight, bias):
+                return torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
 
     class GroupNorm(GGMLLayer, comfy.ops.manual_cast.GroupNorm):
         def forward_ggml_cast_weights(self, input):
-            weight, bias = self.cast_bias_weight(input)
-            return torch.nn.functional.group_norm(input, self.num_groups, weight, bias, self.eps)
+            with self.cast_bias_weight_context(input) as (weight, bias):
+                return torch.nn.functional.group_norm(input, self.num_groups, weight, bias, self.eps)
 
 def move_patch_to_device(item, device):
     if isinstance(item, torch.Tensor):
