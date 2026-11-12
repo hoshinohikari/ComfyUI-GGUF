@@ -233,6 +233,17 @@ class CLIPLoaderGGUF:
         return clip_data
 
     def load_patcher(self, clip_paths, clip_type, clip_data):
+        if getattr(clip_type, "name", None) == "MINIMAX":
+            for i, sd in enumerate(clip_data):
+                norm = sd.get("model.layers.0.input_layernorm.weight")
+                if (norm is not None and norm.shape == (5120,)
+                        and "model.layers.49.self_attn.q_proj.weight" in sd
+                        and "model.visual.deepstack_merger_list.0.norm.weight" in sd):
+                    # Native H3 detection expects visual.*, unlike the 8B Qwen-Image path.
+                    clip_data[i] = {
+                        k[len("model."):] if k.startswith("model.visual.") else k: v
+                        for k, v in sd.items()
+                    }
         clip = comfy.sd.load_text_encoder_state_dicts(
             clip_type = clip_type,
             state_dicts = clip_data,
