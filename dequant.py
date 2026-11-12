@@ -1,9 +1,12 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import gguf
+import numpy as np
 import torch
 import dataclasses
+from functools import lru_cache
 from tqdm import tqdm
 from comfy.quant_ops import QuantizedTensor
+from gguf.quants import IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS
 
 
 TORCH_COMPATIBLE_QTYPES = (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
@@ -255,6 +258,18 @@ def dequantize_blocks_Q2_K(blocks, block_size, type_size, dtype=None):
 # IQ quants
 KVALUES = torch.tensor([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=torch.int8)
 
+# IQ routines adapted from https://github.com/Nif00/ComfyUI-GGUF (Apache-2.0).
+@lru_cache(maxsize=None)
+def _get_iq_grid(iq_cls, device, dtype):
+    iq_cls.init_grid()
+    return torch.from_numpy(np.array(iq_cls.grid).squeeze().copy()).to(device=device, dtype=dtype)
+
+
+@lru_cache(maxsize=None)
+def _get_iq_ksigns(device):
+    IQ2_XXS.init_grid()
+    return torch.from_numpy(np.frombuffer(IQ2_XXS.ksigns, dtype=np.uint8).copy()).to(device=device)
+
 def dequantize_blocks_IQ4_NL(blocks, block_size, type_size, dtype=None):
     n_blocks = blocks.shape[0]
 
@@ -299,6 +314,191 @@ def dequantize_blocks_IQ4_XS(blocks, block_size, type_size, dtype=None):
 
     return (dl * qs).reshape((n_blocks, -1))
 
+def dequantize_blocks_IQ3_S(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, qs, qh, signs, scales = split_block_dims(blocks, 2, 64, 8, 32)
+    d = d.view(torch.float16).to(dtype)
+
+    scales = scales.view(torch.uint8)
+    scales = torch.stack([scales & 0xF, scales >> 4], dim=-1).reshape((n_blocks, 8))
+    db = d * (1 + 2 * scales.to(dtype))
+    db = db.reshape((n_blocks, 8, 1, 1))
+
+    shifts = torch.arange(8, device=d.device, dtype=torch.uint8).reshape((1, 1, 8))
+    signs = (signs.unsqueeze(-1) >> shifts) & 1
+    signs = torch.where(
+        signs == 0,
+        torch.ones(1, dtype=dtype, device=d.device),
+        torch.full((1,), -1.0, dtype=dtype, device=d.device),
+    )
+    signs = signs.reshape((n_blocks, 8, 8, 4))
+
+    qh_bits = (qh.unsqueeze(-1) >> shifts) & 1
+    qh_bits = qh_bits.reshape((n_blocks, 64))
+    qs = qs.to(torch.int16) | (qh_bits.to(torch.int16) << 8)
+
+    grid = _get_iq_grid(IQ3_S, d.device, dtype)
+    grid_val = grid[qs.to(torch.long)].reshape((n_blocks, 8, 8, 4))
+
+    return (db * grid_val * signs).reshape((n_blocks, QK_K))
+
+def dequantize_blocks_IQ3_XXS(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, qs, scales, _ = split_block_dims(blocks, 2, 64, 32)
+    d = d.view(torch.float16).to(dtype)
+
+    scales = scales.reshape((n_blocks, 8, 4)).to(torch.int32)
+    scales = scales[:, :, 0] | scales[:, :, 1] << 8 | scales[:, :, 2] << 16 | scales[:, :, 3] << 24
+
+    db = d * (0.5 + ((scales >> 28) & 0xF).to(dtype)) * 0.5
+    db = db.reshape((n_blocks, 8, 1, 1))
+
+    shifts = torch.tensor([0, 7, 14, 21], device=d.device, dtype=torch.int32).reshape((1, 1, 4))
+    sign_indices = (scales.reshape((n_blocks, 8, 1)) >> shifts) & 0x7F
+
+    ksigns = _get_iq_ksigns(d.device)
+    sign_bytes = ksigns[sign_indices.to(torch.long)]
+
+    shifts_bits = torch.arange(8, device=d.device, dtype=torch.uint8).reshape((1, 1, 1, 8))
+    signs = (sign_bytes.unsqueeze(-1) >> shifts_bits) & 1
+    signs = torch.where(
+        signs == 0,
+        torch.ones(1, dtype=dtype, device=d.device),
+        torch.full((1,), -1.0, dtype=dtype, device=d.device),
+    )
+    signs = signs.reshape((n_blocks, 8, 4, 8))
+
+    grid = _get_iq_grid(IQ3_XXS, d.device, dtype)
+    grid_val = grid[qs.to(torch.long)].reshape((n_blocks, 8, 4, 8))
+
+    return (db * grid_val * signs).reshape((n_blocks, QK_K))
+
+def dequantize_blocks_IQ2_S(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, qs, signs, qh, scales = split_block_dims(blocks, 2, 32, 32, 8)
+    d = d.view(torch.float16).to(dtype)
+
+    scales = scales.view(torch.uint8)
+    scales = torch.stack([scales & 0xF, scales >> 4], dim=-1).reshape((n_blocks, 16))
+    db = d * (0.5 + scales.to(dtype)) * 0.25
+    db = db.reshape((n_blocks, 16, 1, 1))
+
+    shifts = torch.arange(8, device=d.device, dtype=torch.uint8).reshape((1, 1, 8))
+    signs = (signs.unsqueeze(-1) >> shifts) & 1
+    signs = torch.where(
+        signs == 0,
+        torch.ones(1, dtype=dtype, device=d.device),
+        torch.full((1,), -1.0, dtype=dtype, device=d.device),
+    )
+    signs = signs.reshape((n_blocks, 16, 2, 8))
+
+    qh_shifts = torch.tensor([0, 2, 4, 6], device=d.device, dtype=torch.uint8).reshape((1, 1, 4))
+    qh_bits = (qh.view(torch.uint8).reshape((n_blocks, 8, 1)) >> qh_shifts) & 3
+    qh_bits = qh_bits.reshape((n_blocks, 32))
+
+    qs = qs.view(torch.uint8).to(torch.int32)
+    indices = qs | (qh_bits.to(torch.int32) << 8)
+
+    grid = _get_iq_grid(IQ2_S, d.device, dtype)
+    grid_val = grid[indices.to(torch.long)].reshape((n_blocks, 16, 2, 8))
+
+    return (db * grid_val * signs).reshape((n_blocks, QK_K))
+
+def dequantize_blocks_IQ2_XXS(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    d, qs = split_block_dims(blocks, 2)
+    d = d.view(torch.float16).to(dtype)
+
+    u32 = qs.reshape((n_blocks, 16, 4)).to(torch.int32)
+    u32 = u32[:, :, 0] | (u32[:, :, 1] << 8) | (u32[:, :, 2] << 16) | (u32[:, :, 3] << 24)
+    u32 = u32.reshape((n_blocks, 8, 2))
+
+    q0 = u32[:, :, 0]  # grid indices
+    q1 = u32[:, :, 1]  # scales and signs
+
+    db = d * (0.5 + ((q1 >> 28) & 0xF).to(dtype)) * 0.25
+    db = db.reshape((n_blocks, 8, 1, 1))
+
+    shifts = torch.tensor([0, 7, 14, 21], device=d.device, dtype=torch.int32).reshape((1, 1, 4))
+    sign_indices = (q1.unsqueeze(-1) >> shifts) & 0x7F
+
+    ksigns = _get_iq_ksigns(d.device)
+    sign_bytes = ksigns[sign_indices.to(torch.long)]
+
+    shifts_bits = torch.arange(8, device=d.device, dtype=torch.uint8).reshape((1, 1, 1, 8))
+    signs = (sign_bytes.unsqueeze(-1) >> shifts_bits) & 1
+    signs = torch.where(
+        signs == 0,
+        torch.ones(1, dtype=dtype, device=d.device),
+        torch.full((1,), -1.0, dtype=dtype, device=d.device),
+    )
+    signs = signs.reshape((n_blocks, 8, 4, 8))
+
+    indices = q0.contiguous().view(torch.uint8)
+    grid = _get_iq_grid(IQ2_XXS, d.device, dtype)
+    grid_val = grid[indices.to(torch.long)].reshape((n_blocks, 8, 4, 8))
+
+    return (db * grid_val * signs).reshape((n_blocks, QK_K))
+
+def dequantize_blocks_IQ2_XS(blocks, block_size, type_size, dtype=None):
+    n_blocks = blocks.shape[0]
+
+    # Layout:
+    # d:      fp16
+    # qs:     32 packed uint16 values
+    # scales: 8 packed 4-bit scale bytes
+    d, qs, scales = split_block_dims(blocks, 2, 2 * QK_K // 8)
+    d = d.view(torch.float16).to(dtype)
+
+    qs = qs.contiguous().reshape(n_blocks, 32, 2).to(torch.int32)
+    qs = qs[:, :, 0] | (qs[:, :, 1] << 8)
+
+    # Scales
+    shifts_sc = torch.tensor(
+        [0, 4],
+        device=d.device,
+        dtype=torch.uint8,
+    ).reshape(1, 1, 2)
+
+    sc = (scales.unsqueeze(-1) >> shifts_sc) & 0x0F
+
+    db = (
+        d.reshape(n_blocks, 1)
+        * (0.5 + sc.reshape(n_blocks, 16).to(dtype))
+        * 0.25
+    )
+    db = db.reshape(n_blocks, 16, 1, 1)
+
+    # Signs
+    sign_bytes = _get_iq_ksigns(d.device)[
+        (qs >> 9).to(torch.long)
+    ]
+
+    shifts_bits = torch.arange(
+        8,
+        device=d.device,
+        dtype=torch.uint8,
+    ).reshape(1, 1, 8)
+
+    signs = (sign_bytes.unsqueeze(-1) >> shifts_bits) & 1
+    signs = torch.where(
+        signs == 0,
+        torch.ones(1, dtype=dtype, device=d.device),
+        torch.full((1,), -1.0, dtype=dtype, device=d.device),
+    )
+    signs = signs.reshape(n_blocks, 16, 2, 8)
+
+    # Grid
+    grid = _get_iq_grid(IQ2_XS, d.device, dtype)
+    grid_values = grid[(qs & 511).to(torch.long)]
+    grid_values = grid_values.reshape(n_blocks, 16, 2, 8)
+
+    return (db * grid_values * signs).reshape(n_blocks, QK_K)
+
 dequantize_functions = {
     gguf.GGMLQuantizationType.BF16: dequantize_blocks_BF16,
     gguf.GGMLQuantizationType.Q8_0: dequantize_blocks_Q8_0,
@@ -313,4 +513,9 @@ dequantize_functions = {
     gguf.GGMLQuantizationType.Q2_K: dequantize_blocks_Q2_K,
     gguf.GGMLQuantizationType.IQ4_NL: dequantize_blocks_IQ4_NL,
     gguf.GGMLQuantizationType.IQ4_XS: dequantize_blocks_IQ4_XS,
+    gguf.GGMLQuantizationType.IQ3_S: dequantize_blocks_IQ3_S,
+    gguf.GGMLQuantizationType.IQ3_XXS: dequantize_blocks_IQ3_XXS,
+    gguf.GGMLQuantizationType.IQ2_S: dequantize_blocks_IQ2_S,
+    gguf.GGMLQuantizationType.IQ2_XXS: dequantize_blocks_IQ2_XXS,
+    gguf.GGMLQuantizationType.IQ2_XS: dequantize_blocks_IQ2_XS,
 }
