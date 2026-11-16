@@ -7,6 +7,7 @@ import re
 import os
 import ctypes
 import threading
+import json
 
 import comfy.memory_management
 import comfy.storage
@@ -72,6 +73,29 @@ def get_gguf_metadata(reader):
         except:
             continue
     return metadata
+
+def restore_minimax_image_metadata(state_dict, metadata):
+    if "config" in metadata:
+        return metadata
+    if "comfy.gguf.metadata.config" in metadata:
+        return {**metadata, "config": metadata["comfy.gguf.metadata.config"]}
+    if "audio_patch_proj.weight" in state_dict:
+        return metadata
+    patch = state_dict.get("video_patch_proj.weight")
+    head = state_dict.get("final_layer.video_out.weight")
+    if (patch is None or head is None or len(patch.shape) != 2 or len(head.shape) != 2
+            or patch.shape[1] != 96 or head.shape != (576, patch.shape[0])
+            or "condition_proj.weight" not in state_dict):
+        return metadata
+    # Comfy-Org/MiniMax-H3-Image pruned checkpoint metadata: 24 channels,
+    # 2x2 patches, six stacked PDD heads. Some GGUF conversions omit it.
+    config = {"transformer": {
+        "pdd_steps": 6,
+        "pdd_sigmas": [1.0, 0.9675236940383911, 0.8875485062599182,
+                       0.75, 0.5327739119529724, 0.23200887441635132, 0.0],
+    }}
+    return {**metadata, "config": json.dumps(config)}
+
 
 def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False):
     """
@@ -186,9 +210,12 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         state_dict[max_key].is_largest_weight = True
 
     # extra info to return
+    metadata = get_gguf_metadata(reader)
+    if arch_str == "minimax" and not is_text_model:
+        metadata = restore_minimax_image_metadata(state_dict, metadata)
     extra = {
         "arch_str": arch_str,
-        "metadata": get_gguf_metadata(reader)
+        "metadata": metadata
     }
     return (state_dict, extra)
 

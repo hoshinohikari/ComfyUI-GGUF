@@ -160,7 +160,9 @@ class ModelKrea2(ModelTemplate):
 class ModelMiniMax(ModelTemplate):
     arch = "minimax"
     keys_detect = [
-        ("video_patch_proj.weight", "audio_patch_proj.weight")
+        ("video_patch_proj.weight", "audio_patch_proj.weight"),
+        ("video_patch_proj.weight", "condition_proj.weight",
+         "final_layer.video_out.weight", "token_refiner.final_norm.weight"),
     ]
 
 class QwenImage21(ModelTemplate):
