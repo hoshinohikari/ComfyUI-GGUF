@@ -28,6 +28,20 @@ Note: The "Force/Set CLIP Device" is **NOT** part of this node pack. Do not inst
 
 ## Installation
 
+### Windows one-click install (GitHub Release binary)
+
+Close ComfyUI and double-click `install.cmd`. It discovers the ComfyUI source directory and its Python from the surrounding directories or standard Desktop install locations, then installs the matching Release extension. If multiple installations/Python environments are found, select one explicitly:
+
+```powershell
+.\install.cmd -ComfyUIPath "<ComfyUI source directory>" -Python "<ComfyUI Python executable>"
+```
+
+You can also download `install.ps1` alone and run it with those parameters; it clones this fork into `custom_nodes/ComfyUI-GGUF` if absent (Git required). Existing source checkouts are not reset or updated automatically. An old checkout lacking the installer needs a manual source update first. Portable Python and `.venv` paths are detected; Conda/system Python can be selected with `-Python`.
+
+The installer checks Windows x64, CPython 3.13, CUDA Torch and the selected GPU, then searches stable Releases in `hoshinohikari/ComfyUI-GGUF` for a matching ZIP and SHA256. It validates the archive, native-source build ID, GPU target and extension metadata before replacing the binary, and backs up old extensions outside `native/build`. Plugin requirements are installed with `--no-deps` to preserve the host Torch; ComfyUI must already provide their transitive dependencies. No CUDA Toolkit or compiler is downloaded, and no generation or automatic restart is performed. Missing runtime DLLs or an unsupported environment produce an error; use `original` or build from source instead. Existing extension files are preserved if the pre-install checks fail.
+
+Use `-ReleaseTag v0.0.1` to select a release. `-DryRun` checks environment and candidate assets without installing dependencies, downloading ZIPs or replacing files; full build-ID/DLL checks occur during installation. A precompiled extension still requires its matching source and compatible CUDA/VC++ runtime libraries.
+
 > [!IMPORTANT]  
 > Make sure your ComfyUI is on a recent-enough version to support custom ops when loading the UNET-only.
 
