@@ -7,10 +7,12 @@ from functools import lru_cache
 from tqdm import tqdm
 from comfy.quant_ops import QuantizedTensor
 from gguf.quants import IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS
+from .gguf_compat import ensure_gguf_q2_0_type
 
 
 TORCH_COMPATIBLE_QTYPES = (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
 GGUF_QUANTIZED_LAYOUT = "ComfyUI-GGUF"
+ensure_gguf_q2_0_type()
 
 def is_torch_compatible(tensor):
     if isinstance(tensor, QuantizedTensor):
@@ -43,14 +45,21 @@ def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
         # this is incredibly slow
         tqdm.write(f"Falling back to numpy dequant for qtype: {getattr(qtype, 'name', repr(qtype))}")
         new = gguf.quants.dequantize(tensor.cpu().numpy(), qtype)
-        return torch.from_numpy(new).to(tensor.device, dtype=dtype)
+        return torch.from_numpy(new).to(tensor.device, dtype=dtype).reshape(oshape)
 
 def dequantize(data, qtype, oshape, dtype=None):
     """
     Dequantize tensor back to usable shape/dtype
     """
     block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
-    dequantize_blocks = dequantize_functions[qtype]
+    dequantize_blocks = dequantize_functions.get(qtype)
+
+    if dequantize_blocks is None:
+        # Preserve the original fallback for upstream formats not implemented here (Q1_0/Q2_0).
+        tqdm.write(f"Falling back to numpy dequant for qtype: {getattr(qtype, 'name', repr(qtype))}")
+        values = gguf.quants.dequantize(data.detach().cpu().contiguous().numpy(), qtype)
+        out_dtype = dtype if dtype is not None else torch.float32
+        return torch.from_numpy(np.asarray(values)).to(device=data.device, dtype=out_dtype).reshape(oshape)
 
     rows = data.reshape(
         (-1, data.shape[-1])
@@ -85,6 +94,16 @@ def dequantize_blocks_Q8_0(blocks, block_size, type_size, dtype=None):
     d = d.view(torch.float16).to(dtype)
     x = x.view(torch.int8)
     return (d * x)
+
+
+def dequantize_blocks_Q2_0(blocks, block_size, type_size, dtype=None):
+    d, qs = split_block_dims(blocks, 2)
+    out_dtype = dtype if dtype is not None else torch.float32
+    d = d.view(torch.float16).to(out_dtype).reshape(-1, 1)
+    qs = qs.view(torch.uint8).to(torch.int32)
+    shifts = torch.tensor((0, 2, 4, 6), device=qs.device, dtype=torch.int32)
+    values = ((qs.unsqueeze(-1) >> shifts) & 0x03).reshape(-1, block_size)
+    return (values.to(out_dtype) - 1) * d
 
 def dequantize_blocks_Q5_1(blocks, block_size, type_size, dtype=None):
     n_blocks = blocks.shape[0]
@@ -500,6 +519,7 @@ def dequantize_blocks_IQ2_XS(blocks, block_size, type_size, dtype=None):
     return (db * grid_values * signs).reshape(n_blocks, QK_K)
 
 dequantize_functions = {
+    gguf.GGMLQuantizationType.Q2_0: dequantize_blocks_Q2_0,
     gguf.GGMLQuantizationType.BF16: dequantize_blocks_BF16,
     gguf.GGMLQuantizationType.Q8_0: dequantize_blocks_Q8_0,
     gguf.GGMLQuantizationType.Q5_1: dequantize_blocks_Q5_1,

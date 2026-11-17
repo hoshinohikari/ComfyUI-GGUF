@@ -13,7 +13,7 @@ import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
-from .ops import GGMLOps, move_patch_to_device
+from .ops import make_gguf_ops, move_patch_to_device
 from .loader import gguf_sd_loader, gguf_clip_loader
 from .dequant import is_quantized, is_torch_compatible
 
@@ -100,12 +100,17 @@ class GGUFModelPatcher(comfy.model_patcher.CoreModelPatcher):
         return n
 
 class UnetLoaderGGUF:
+    COMPUTE_MODES = ["mixed", "int8", "ggml", "original"]
+
     @classmethod
     def INPUT_TYPES(s):
         unet_names = [x for x in folder_paths.get_filename_list("unet_gguf")]
         return {
             "required": {
                 "unet_name": (unet_names,),
+            },
+            "optional": {
+                "compute_mode": (s.COMPUTE_MODES, {"default": "ggml"}),
             }
         }
 
@@ -114,8 +119,8 @@ class UnetLoaderGGUF:
     CATEGORY = "bootleg"
     TITLE = "Unet Loader (GGUF)"
 
-    def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
-        ops = GGMLOps()
+    def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None, compute_mode="ggml"):
+        ops = make_gguf_ops(compute_mode)()
 
         if dequant_dtype in ("default", None):
             ops.Linear.dequant_dtype = None
@@ -160,11 +165,16 @@ class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
                 "dequant_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
                 "patch_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
                 "patch_on_device": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "compute_mode": (s.COMPUTE_MODES, {"default": "ggml"}),
             }
         }
     TITLE = "Unet Loader (GGUF/Advanced)"
 
 class CLIPLoaderGGUF:
+    COMPUTE_MODES = ["mixed", "int8", "ggml", "original"]
+
     @classmethod
     def INPUT_TYPES(s):
         base = nodes.CLIPLoader.INPUT_TYPES()
@@ -172,6 +182,9 @@ class CLIPLoaderGGUF:
             "required": {
                 "clip_name": (s.get_filename_list(),),
                 "type": base["required"]["type"],
+            },
+            "optional": {
+                "compute_mode": (s.COMPUTE_MODES, {"default": "ggml"}),
             }
         }
 
@@ -199,7 +212,7 @@ class CLIPLoaderGGUF:
             clip_data.append(sd)
         return clip_data
 
-    def load_patcher(self, clip_paths, clip_type, clip_data):
+    def load_patcher(self, clip_paths, clip_type, clip_data, compute_mode="ggml"):
         if getattr(clip_type, "name", None) == "MINIMAX":
             for i, sd in enumerate(clip_data):
                 norm = sd.get("model.layers.0.input_layernorm.weight")
@@ -215,7 +228,7 @@ class CLIPLoaderGGUF:
             clip_type = clip_type,
             state_dicts = clip_data,
             model_options = {
-                "custom_operations": GGMLOps,
+                "custom_operations": make_gguf_ops(compute_mode),
                 "initial_device": comfy.model_management.text_encoder_offload_device()
             },
             embedding_directory = folder_paths.get_folder_paths("embeddings"),
@@ -223,10 +236,10 @@ class CLIPLoaderGGUF:
         clip.patcher = GGUFModelPatcher.clone(clip.patcher)
         return clip
 
-    def load_clip(self, clip_name, type="stable_diffusion"):
+    def load_clip(self, clip_name, type="stable_diffusion", compute_mode="ggml"):
         clip_path = folder_paths.get_full_path("clip", clip_name)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path])),)
+        return (self.load_patcher([clip_path], clip_type, self.load_data([clip_path]), compute_mode),)
 
 class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -238,17 +251,20 @@ class DualCLIPLoaderGGUF(CLIPLoaderGGUF):
                 "clip_name1": file_options,
                 "clip_name2": file_options,
                 "type": base["required"]["type"],
+            },
+            "optional": {
+                "compute_mode": (s.COMPUTE_MODES, {"default": "ggml"}),
             }
         }
 
     TITLE = "DualCLIPLoader (GGUF)"
 
-    def load_clip(self, clip_name1, clip_name2, type):
+    def load_clip(self, clip_name1, clip_name2, type, compute_mode="ggml"):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
         clip_path2 = folder_paths.get_full_path("clip", clip_name2)
         clip_paths = (clip_path1, clip_path2)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths), compute_mode),)
 
 class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -259,18 +275,21 @@ class TripleCLIPLoaderGGUF(CLIPLoaderGGUF):
                 "clip_name1": file_options,
                 "clip_name2": file_options,
                 "clip_name3": file_options,
+            },
+            "optional": {
+                "compute_mode": (s.COMPUTE_MODES, {"default": "ggml"}),
             }
         }
 
     TITLE = "TripleCLIPLoader (GGUF)"
 
-    def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3"):
+    def load_clip(self, clip_name1, clip_name2, clip_name3, type="sd3", compute_mode="ggml"):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
         clip_path2 = folder_paths.get_full_path("clip", clip_name2)
         clip_path3 = folder_paths.get_full_path("clip", clip_name3)
         clip_paths = (clip_path1, clip_path2, clip_path3)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths), compute_mode),)
 
 class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
     @classmethod
@@ -282,19 +301,22 @@ class QuadrupleCLIPLoaderGGUF(CLIPLoaderGGUF):
             "clip_name2": file_options,
             "clip_name3": file_options,
             "clip_name4": file_options,
-        }
+            },
+            "optional": {
+                "compute_mode": (s.COMPUTE_MODES, {"default": "ggml"}),
+            }
     }
 
     TITLE = "QuadrupleCLIPLoader (GGUF)"
 
-    def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion"):
+    def load_clip(self, clip_name1, clip_name2, clip_name3, clip_name4, type="stable_diffusion", compute_mode="ggml"):
         clip_path1 = folder_paths.get_full_path("clip", clip_name1)
         clip_path2 = folder_paths.get_full_path("clip", clip_name2)
         clip_path3 = folder_paths.get_full_path("clip", clip_name3)
         clip_path4 = folder_paths.get_full_path("clip", clip_name4)
         clip_paths = (clip_path1, clip_path2, clip_path3, clip_path4)
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths)),)
+        return (self.load_patcher(clip_paths, clip_type, self.load_data(clip_paths), compute_mode),)
 
 NODE_CLASS_MAPPINGS = {
     "UnetLoaderGGUF": UnetLoaderGGUF,
