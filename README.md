@@ -64,11 +64,16 @@ The setting is per loader, so the diffusion model and text encoder can use diffe
 The known build environment is Windows x64, CPython 3.13, Torch `2.12.1+cu130`, CUDA Toolkit 13.5, MSVC, CMake, Ninja and an NVIDIA SM86 GPU. Other toolchain, Torch and GPU combinations have not been established as compatible. Use the Python that runs your ComfyUI; do not replace its Torch merely to build this plugin.
 
 1. Install Git, the CUDA Toolkit and Visual Studio C++ build tools, and make CMake and Ninja available on `PATH`. Set `CUDA_PATH` to the toolkit root. `vswhere` discovers Visual Studio, including prerelease installations. The toolkit/compiler combination must itself be compatible.
-2. Obtain a ggml Git checkout containing commit `d9fe7bff3d2bf4d077e25c654486d02c321734aa`. This repository does not currently include a ggml submodule; `third_party/ggml` is only the default expected path. Supply `--ggml-repo` if the checkout is elsewhere.
-3. From this plugin directory, run the build using your ComfyUI Python:
+2. From the plugin directory, initialize the ggml submodule pinned to commit `d9fe7bff3d2bf4d077e25c654486d02c321734aa`:
 
 ```powershell
-& "<ComfyUI Python executable>" tools/build_native.py --ggml-repo "<ggml checkout>"
+git submodule update --init --recursive
+```
+
+3. Run the build using your ComfyUI Python. It uses `third_party/ggml` by default; supply `--ggml-repo` to use another checkout containing the pinned commit:
+
+```powershell
+& "<ComfyUI Python executable>" tools/build_native.py
 ```
 
 The script discovers Torch headers and import libraries from that Python. It also accepts `--cuda-root`, `--vs-root`, `--cmake`, `--ninja`, `--build-dir` and `--patched-source` when automatic discovery or the defaults do not fit. Use `--help` for details. The output is placed in `native/build`; restart ComfyUI to load a newly built extension.
@@ -77,7 +82,7 @@ If the installed Torch lacks development files, extract them from a matching Tor
 
 ```powershell
 & "<ComfyUI Python executable>" tools/extract_torch_sdk.py "<matching torch wheel>" "<SDK directory>" --sha256 "<wheel SHA256>"
-& "<ComfyUI Python executable>" tools/build_native.py --ggml-repo "<ggml checkout>" --torch-sdk "<SDK directory>\torch"
+& "<ComfyUI Python executable>" tools/build_native.py --torch-sdk "<SDK directory>\torch"
 ```
 
 The build creates a detached worktree at the pinned ggml commit, applies the bridge there, builds SM86 and checks that the extension imports. It does not run a CUDA kernel. The legacy nine-argument `tools/build_ggml_backend.cmd` is still available. Build output is excluded from Git, and inference does not compile at runtime.
