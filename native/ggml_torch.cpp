@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 
 #include "ggml.h"
 
@@ -20,8 +21,8 @@
 #define COMFYUI_TORCH_BUILD "unknown"
 #endif
 
-#ifndef COMFYUI_CUDA_ARCH
-#define COMFYUI_CUDA_ARCH 0
+#ifndef COMFYUI_CUDA_ARCHS
+#define COMFYUI_CUDA_ARCHS ""
 #endif
 
 #ifndef COMFYUI_BUILD_ID
@@ -223,7 +224,13 @@ pybind11::dict build_info() {
   info["build_id"] = COMFYUI_BUILD_ID;
   info["cuda_runtime"] = std::to_string(runtime_version / 1000) + "." +
       std::to_string((runtime_version % 1000) / 10);
-  info["cuda_arch"] = COMFYUI_CUDA_ARCH;
+  pybind11::list architectures;
+  std::istringstream arch_stream(COMFYUI_CUDA_ARCHS);
+  std::string arch;
+  while (std::getline(arch_stream, arch, ',')) {
+    architectures.append(std::stoi(arch));
+  }
+  info["cuda_archs"] = architectures;
   info["workspace_limit"] = kDefaultWorkspaceLimit;
   info["weight_types"] = pybind11::make_tuple(
       "Q1_0", "Q2_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0",

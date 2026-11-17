@@ -18,7 +18,7 @@ GGML backend and build changes (`cb4ff1e`):
 - Add Q2_0 reader/dequantization compatibility and extend the supported MMQ weight formats. Embeddings, normalization, floating-point layers and unsupported Linear cases follow their applicable existing paths.
 - Add experimental `mixed` and `int8` Tensor Core modes, ggml as the loader default, and native build and verification scripts.
 
-The current ggml build targets Windows x64 and NVIDIA SM86; it is not a general binary for all GPUs or Torch versions. Some earlier GGML runs completed on an RTX 3060, but support added since those runs and the new build entry point require further real-device verification.
+The Windows build now defaults to GeForce RTX 20/30/40/50 targets (SM75/86/89/120). This is build configuration support, not verification on all four generations. Some earlier GGML runs completed on an RTX 3060; other GPUs and the new multi-architecture build still require compilation and real-device verification. Python/Torch/runtime compatibility remains mandatory.
 
 While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
 
@@ -61,7 +61,7 @@ The setting is per loader, so the diffusion model and text encoder can use diffe
 
 ### Building the ggml extension on Windows
 
-The known build environment is Windows x64, CPython 3.13, Torch `2.12.1+cu130`, CUDA Toolkit 13.5, MSVC, CMake, Ninja and an NVIDIA SM86 GPU. Other toolchain, Torch and GPU combinations have not been established as compatible. Use the Python that runs your ComfyUI; do not replace its Torch merely to build this plugin.
+The known local toolchain is Windows x64, CPython 3.13, Torch `2.12.1+cu130`, CUDA Toolkit 13.5, MSVC, CMake and Ninja. Use the Python that runs your ComfyUI; do not replace its Torch merely to build this plugin. The toolkit must support every requested architecture; the Python wrapper checks the compiler's supported targets before building.
 
 1. Install Git, the CUDA Toolkit and Visual Studio C++ build tools, and make CMake and Ninja available on `PATH`. Set `CUDA_PATH` to the toolkit root. `vswhere` discovers Visual Studio, including prerelease installations. The toolkit/compiler combination must itself be compatible.
 2. From the plugin directory, initialize the ggml submodule pinned to commit `d9fe7bff3d2bf4d077e25c654486d02c321734aa`:
@@ -78,6 +78,15 @@ git submodule update --init --recursive
 
 The script discovers Torch headers and import libraries from that Python. It also accepts `--cuda-root`, `--vs-root`, `--cmake`, `--ninja`, `--build-dir` and `--patched-source` when automatic discovery or the defaults do not fit. Use `--help` for details. The output is placed in `native/build`; restart ComfyUI to load a newly built extension.
 
+By default one extension contains SM75, SM86, SM89 and SM120 device code, covering GeForce RTX 20, 30, 40 and 50 respectively. The pinned ggml requires `120a-real` for its Blackwell instructions. To reduce compile time and binary size, build a subset:
+
+```powershell
+& "<ComfyUI Python executable>" tools/build_native.py --cuda-archs 86
+& "<ComfyUI Python executable>" tools/build_native.py --cuda-archs 86,89,120
+```
+
+The legacy CMD entry reads the semicolon-separated `COMFYUI_CUDA_ARCHS` environment variable (default `75;86;89;120`). CMake uses `COMFYUI_CUDA_ARCHS` to generate real device-code targets; set that variable rather than `CMAKE_CUDA_ARCHITECTURES`. `build_info().cuda_archs` records the selected capabilities, and the loader checks the actual device against that list. No PTX forward-compatibility fallback is promised. Multi-architecture support does not remove the extension's Python/Torch/CUDA runtime requirements.
+
 If the installed Torch lacks development files, extract them from a matching Torch wheel. The extractor's default SHA256 is for the local `torch-2.12.1+cu130-cp313-cp313-win_amd64.whl`; for another wheel, supply its independently verified `--sha256`. The wheel must match the active Torch version, Python and platform. The wrapper checks its SDK manifest; it does not install or replace Torch.
 
 ```powershell
@@ -85,7 +94,9 @@ If the installed Torch lacks development files, extract them from a matching Tor
 & "<ComfyUI Python executable>" tools/build_native.py --torch-sdk "<SDK directory>\torch"
 ```
 
-The build creates a detached worktree at the pinned ggml commit, applies the bridge there, builds SM86 and checks that the extension imports. It does not run a CUDA kernel. The legacy nine-argument `tools/build_ggml_backend.cmd` is still available. Build output is excluded from Git, and inference does not compile at runtime.
+The build creates a detached worktree at the pinned ggml commit, applies the bridge there, builds the selected architectures and checks that the extension imports and reports the requested architecture list. It does not run a CUDA kernel. The legacy nine-argument `tools/build_ggml_backend.cmd` is still available. Build output is excluded from Git, and inference does not compile at runtime.
+
+Rebuild after updating to this multi-architecture implementation: older SM86-only binaries do not satisfy the new source/metadata contract. Native source fingerprints normalize CRLF to LF so Git line-ending conversion alone no longer invalidates an otherwise matching build.
 
 LoRA loading is experimental but it should work with just the built-in LoRA loader node(s).
 

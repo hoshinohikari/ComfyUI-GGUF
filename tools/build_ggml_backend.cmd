@@ -19,7 +19,7 @@ set "CUDA_PATH=%CUDA_ROOT%"
 set "CUDAToolkit_ROOT=%CUDA_ROOT%"
 set "CUDACXX=%CUDA_ROOT%\bin\nvcc.exe"
 set "PATH=%CUDA_ROOT%\bin;%PATH%"
-set "TORCH_CUDA_ARCH_LIST=8.6"
+if not defined COMFYUI_CUDA_ARCHS set "COMFYUI_CUDA_ARCHS=75;86;89;120"
 
 if not exist "%GGML_REPO%\.git" (
     echo ERROR: ggml git checkout not found: %GGML_REPO%
@@ -76,7 +76,7 @@ if "%TORCH_BUILD%"=="" (
     -DCMAKE_MAKE_PROGRAM="%NINJA_EXE%" ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_CUDA_COMPILER="%CUDA_ROOT%\bin\nvcc.exe" ^
-    -DCMAKE_CUDA_ARCHITECTURES=86 ^
+    "-DCOMFYUI_CUDA_ARCHS=%COMFYUI_CUDA_ARCHS%" ^
     -DCUDAToolkit_ROOT="%CUDA_ROOT%" ^
     -DPython3_EXECUTABLE="%PYTHON_EXE%" ^
     -DCOMFYUI_GGML_SOURCE="%PATCHED_SOURCE%" ^
@@ -87,10 +87,10 @@ if "%TORCH_BUILD%"=="" (
     -DCOMFYUI_NATIVE_OUTPUT="%PLUGIN_ROOT%\native\build"
 if errorlevel 1 exit /b %errorlevel%
 
-"%CMAKE_EXE%" --build "%BUILD_DIR%" --target _comfyui_gguf_ggml --config Release --parallel
+"%CMAKE_EXE%" --build "%BUILD_DIR%" --target _comfyui_gguf_ggml --config Release --parallel %CMAKE_BUILD_PARALLEL_LEVEL%
 if errorlevel 1 exit /b %errorlevel%
 
-"%PYTHON_EXE%" "%PLUGIN_ROOT%\tools\verify_ggml_extension.py" "%PLUGIN_ROOT%\native\build" --build-id "%BUILD_ID%" --torch-build "%TORCH_BUILD%"
+"%PYTHON_EXE%" "%PLUGIN_ROOT%\tools\verify_ggml_extension.py" "%PLUGIN_ROOT%\native\build" --build-id "%BUILD_ID%" --torch-build "%TORCH_BUILD%" --cuda-archs "%COMFYUI_CUDA_ARCHS%"
 if errorlevel 1 exit /b %errorlevel%
 exit /b 0
 

@@ -12,6 +12,16 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def parse_archs(value: str) -> list[int]:
+    try:
+        result = sorted(set(int(v) for v in value.replace(",", ";").split(";")))
+    except ValueError as exc:
+        raise ValueError("Use --cuda-archs 75,86,89,120 (or a subset)") from exc
+    if not result or set(result) - {75, 86, 89, 120}:
+        raise ValueError("Supported GeForce targets are 75, 86, 89 and 120")
+    return result
+
+
 def executable(name: str, override: str | None) -> str:
     found = shutil.which(override or name)
     if not found:
@@ -52,6 +62,7 @@ def main() -> None:
     parser.add_argument("--vs-root", type=Path)
     parser.add_argument("--cmake")
     parser.add_argument("--ninja")
+    parser.add_argument("--cuda-archs", default="75,86,89,120", help="RTX 20/30/40/50 targets; comma-separated, default: %(default)s")
     args = parser.parse_args()
     if sys.platform != "win32":
         raise ValueError("This build entry point currently supports Windows only")
@@ -61,6 +72,12 @@ def main() -> None:
         raise ValueError("The active Python does not have a CUDA-enabled Torch")
     if not args.cuda_root:
         raise ValueError("CUDA_PATH is unset; provide --cuda-root")
+    archs = parse_archs(args.cuda_archs)
+    nvcc = Path(args.cuda_root) / "bin" / "nvcc.exe"
+    codes = subprocess.check_output([str(nvcc), "--list-gpu-code"], text=True).split()
+    missing = [a for a in archs if f"sm_{a}" not in codes]
+    if missing:
+        raise ValueError(f"CUDA compiler does not support targets {missing}; select a newer toolkit or a subset with --cuda-archs")
     vs = args.vs_root
     if not vs:
         vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
@@ -71,7 +88,9 @@ def main() -> None:
         raise ValueError("Visual Studio C++ tools not found; provide --vs-root")
     command = [str(ROOT / "tools" / "build_ggml_backend.cmd"), str(args.ggml_repo.resolve()), str(args.patched_source.resolve()), str(args.build_dir.resolve()), str(sdk), str(Path(args.cuda_root).resolve()), str(vs.resolve()), sys.executable, executable("cmake", args.cmake), executable("ninja", args.ninja)]
     print(f"Using Torch {torch.__version__} from {torch.__file__}; SDK: {sdk}", flush=True)
-    subprocess.run(command, check=True)
+    environment = os.environ.copy()
+    environment["COMFYUI_CUDA_ARCHS"] = ";".join(map(str, archs))
+    subprocess.run(command, check=True, env=environment)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ def main() -> None:
     parser.add_argument("extension_directory", type=Path)
     parser.add_argument("--build-id", required=True)
     parser.add_argument("--torch-build", required=True)
+    parser.add_argument("--cuda-archs", required=True)
     args = parser.parse_args()
 
     binaries = list(args.extension_directory.glob("_comfyui_gguf_ggml*.pyd"))
@@ -27,6 +28,9 @@ def main() -> None:
     spec.loader.exec_module(module)
 
     info = module.build_info()
+    expected_archs = sorted(int(a) for a in args.cuda_archs.replace(",", ";").split(";"))
+    if sorted(info.get("cuda_archs", [])) != expected_archs:
+        raise RuntimeError("Native extension architecture list does not match this build")
     if info.get("build_id") != args.build_id:
         raise RuntimeError("Native extension build ID does not match the current source")
     if info.get("torch_build") != args.torch_build or torch.__version__ != args.torch_build:
@@ -37,7 +41,7 @@ def main() -> None:
     print(
         "Import check passed without running a CUDA kernel: "
         f"ggml={info['ggml_commit']} CUDA={info['cuda_runtime']} "
-        f"SM{info['cuda_arch']} Torch={info['torch_build']}"
+        f"SMs={info['cuda_archs']} Torch={info['torch_build']}"
     )
 
 

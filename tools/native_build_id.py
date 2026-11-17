@@ -20,7 +20,7 @@ def compute_build_id() -> str:
     for relative in FILES:
         digest.update(relative.as_posix().encode("utf-8"))
         digest.update(b"\0")
-        digest.update((ROOT / relative).read_bytes())
+        digest.update((ROOT / relative).read_bytes().replace(b"\r\n", b"\n"))
         digest.update(b"\0")
     return digest.hexdigest()
 

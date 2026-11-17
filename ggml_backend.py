@@ -16,7 +16,7 @@ import torch
 
 
 EXPECTED_GGML_COMMIT = "d9fe7bff3d2bf4d077e25c654486d02c321734aa"
-EXPECTED_CUDA_ARCH = 86
+SUPPORTED_CUDA_ARCHS = frozenset({75, 86, 89, 120})
 WORKSPACE_LIMIT_BYTES = 64 * 1024 * 1024
 GGML_MMQ_WEIGHT_TYPES = (
     "Q1_0", "Q2_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0",
@@ -46,7 +46,7 @@ def _expected_build_id() -> str:
     for relative in source_files:
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
-        digest.update((root / relative).read_bytes())
+        digest.update((root / relative).read_bytes().replace(b"\r\n", b"\n"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -150,15 +150,13 @@ def _load_extension() -> Any:
                 f"ggml extension CUDA runtime {extension_cuda!r} is incompatible with "
                 f"Torch CUDA {runtime_cuda!r}. Rebuild with a matching CUDA 13.x toolkit."
             )
-        if info.get("cuda_arch") != EXPECTED_CUDA_ARCH:
-            raise RuntimeError(
-                f"ggml extension targets SM{info.get('cuda_arch')}, expected SM{EXPECTED_CUDA_ARCH}. "
-                "Rebuild for the RTX 3060."
-            )
+        archs = info.get("cuda_archs", ())
+        if not archs or any(type(a) is not int or a not in SUPPORTED_CUDA_ARCHS for a in archs):
+            raise RuntimeError("ggml extension has an invalid or outdated architecture list; rebuild the extension")
 
         logging.info(
-            "ComfyUI-GGUF ggml backend ready: ggml=%s CUDA=%s target=SM%d Torch=%s",
-            info["ggml_commit"], info["cuda_runtime"], info["cuda_arch"], info["torch_build"],
+            "ComfyUI-GGUF ggml backend ready: ggml=%s CUDA=%s targets=%s Torch=%s",
+            info["ggml_commit"], info["cuda_runtime"], archs, info["torch_build"],
         )
         _module = module
         return module
@@ -179,10 +177,12 @@ def ensure_device(device: torch.device) -> None:
         if device_index in _checked_devices:
             return
         capability = torch.cuda.get_device_capability(device_index)
-        if capability != (8, 6):
+        arch = capability[0] * 10 + capability[1]
+        compiled_archs = _load_extension().build_info()["cuda_archs"]
+        if arch not in compiled_archs:
             raise RuntimeError(
-                f"The installed ggml extension targets RTX 3060 SM86; device cuda:{device_index} "
-                f"reports SM{capability[0]}{capability[1]}. Rebuild the native extension for this GPU architecture."
+                f"The installed ggml extension targets {compiled_archs}; device cuda:{device_index} "
+                f"reports SM{arch}. Rebuild the native extension for this GPU architecture."
             )
         _checked_devices.add(device_index)
 

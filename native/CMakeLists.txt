@@ -28,7 +28,23 @@ set(GGML_CUDA_FORCE_CUBLAS OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA_FA OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA_NCCL OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA_NO_VMM ON CACHE BOOL "" FORCE)
-set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "Build only for RTX 3060 SM86" FORCE)
+set(COMFYUI_CUDA_ARCHS "75;86;89;120" CACHE STRING "GeForce RTX target compute capabilities")
+set(CMAKE_CUDA_ARCHITECTURES "")
+foreach(arch IN LISTS COMFYUI_CUDA_ARCHS)
+    if(NOT arch MATCHES "^(75|86|89|120)$")
+        message(FATAL_ERROR "Unsupported target ${arch}; choose 75, 86, 89 or 120")
+    endif()
+    # The pinned ggml uses architecture-specific Blackwell instructions.
+    if(arch STREQUAL "120")
+        list(APPEND CMAKE_CUDA_ARCHITECTURES "120a-real")
+    else()
+        list(APPEND CMAKE_CUDA_ARCHITECTURES "${arch}-real")
+    endif()
+endforeach()
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+    message(FATAL_ERROR "COMFYUI_CUDA_ARCHS must not be empty")
+endif()
+string(REPLACE ";" "," COMFYUI_CUDA_ARCHS_CSV "${COMFYUI_CUDA_ARCHS}")
 
 add_subdirectory("${COMFYUI_GGML_SOURCE}" ggml)
 
@@ -47,7 +63,7 @@ target_compile_definitions(_comfyui_gguf_ggml PRIVATE
     COMFYUI_GGML_COMMIT="${COMFYUI_GGML_COMMIT}"
     COMFYUI_TORCH_BUILD="${COMFYUI_TORCH_BUILD}"
     COMFYUI_BUILD_ID="${COMFYUI_BUILD_ID}"
-    COMFYUI_CUDA_ARCH=86
+    COMFYUI_CUDA_ARCHS="${COMFYUI_CUDA_ARCHS_CSV}"
 )
 target_link_directories(_comfyui_gguf_ggml PRIVATE
     "${TORCH_SDK_ROOT}/lib"
@@ -77,7 +93,7 @@ foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
     )
 endforeach()
 
-message(STATUS "Building ComfyUI-GGUF ggml MMQ bridge for SM86")
+message(STATUS "Building ComfyUI-GGUF ggml MMQ bridge for ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "Pinned ggml: ${COMFYUI_GGML_COMMIT}")
 message(STATUS "Torch build: ${COMFYUI_TORCH_BUILD}")
 message(STATUS "CUDA toolkit: ${CUDAToolkit_VERSION}")
