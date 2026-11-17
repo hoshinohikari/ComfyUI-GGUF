@@ -1,7 +1,24 @@
-# ComfyUI-GGUF
-GGUF Quantization support for native ComfyUI models
+# ComfyUI-GGUF2: GGUF Quantization support for native ComfyUI models
 
 This is currently very much WIP. These custom nodes provide support for model files stored in the GGUF format popularized by [llama.cpp](https://github.com/ggerganov/llama.cpp).
+
+## Changes since leejet/HEAD
+
+The comparison baseline is local `leejet/HEAD` at `373048b8403a7820620065210a691263d4da0a61`. The following changes have been committed on this branch; they have not been published as a release.
+
+Committed changes:
+
+- Detect MiniMax H3 32B text encoders and restore metadata for compatible MiniMax image GGUF models.
+- Integrate file-backed GGUF weights with ComfyUI DynamicVRAM and its loading/offload paths.
+- Add PyTorch dequantization for IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S and IQ3_XXS weights.
+
+GGML backend and build changes (`cb4ff1e`):
+
+- Add a pinned ggml CUDA MMQ backend for supported quantized Linear layers, retaining packed GGUF weights and using Q8_1 activations. It uses the active CUDA stream and a bounded workspace.
+- Add Q2_0 reader/dequantization compatibility and extend the supported MMQ weight formats. Embeddings, normalization, floating-point layers and unsupported Linear cases follow their applicable existing paths.
+- Add experimental `mixed` and `int8` Tensor Core modes, ggml as the loader default, and native build and verification scripts.
+
+The current ggml build targets Windows x64 and NVIDIA SM86; it is not a general binary for all GPUs or Torch versions. Some earlier GGML runs completed on an RTX 3060, but support added since those runs and the new build entry point require further real-device verification.
 
 While quantization wasn't feasible for regular UNET models (conv2d), transformer/DiT models such as flux seem less affected by quantization. This allows running it in much lower bits per weight variable bitrate quants on low-end GPUs. For further VRAM savings, a node to load a quantized version of the T5 text encoder is also included.
 
@@ -14,16 +31,16 @@ Note: The "Force/Set CLIP Device" is **NOT** part of this node pack. Do not inst
 > [!IMPORTANT]  
 > Make sure your ComfyUI is on a recent-enough version to support custom ops when loading the UNET-only.
 
-To install the custom node normally, git clone this repository into your custom nodes folder (`ComfyUI/custom_nodes`) and install the only dependency for inference (`pip install --upgrade gguf`)
+Clone this fork into `ComfyUI/custom_nodes` and install `requirements.txt` with the Python used by ComfyUI. Replace `<fork URL>` with this fork's published URL; the city96 upstream URL does not contain the changes described above.
 
 ```
-git clone https://github.com/city96/ComfyUI-GGUF
+git clone <fork URL> ComfyUI-GGUF
 ```
 
 To install the custom node on a standalone ComfyUI release, open a CMD inside the "ComfyUI_windows_portable" folder (where your `run_nvidia_gpu.bat` file is) and use the following commands:
 
 ```
-git clone https://github.com/city96/ComfyUI-GGUF ComfyUI/custom_nodes/ComfyUI-GGUF
+git clone <fork URL> ComfyUI/custom_nodes/ComfyUI-GGUF
 .\python_embeded\python.exe -s -m pip install -r .\ComfyUI\custom_nodes\ComfyUI-GGUF\requirements.txt
 ```
 
@@ -32,6 +49,38 @@ On MacOS sequoia, torch 2.4.1 seems to be required, as 2.6.X nightly versions ca
 ## Usage
 
 Simply use the GGUF Unet loader found under the `bootleg` category. Place the .gguf model files in your `ComfyUI/models/unet` folder.
+
+The GGUF UNet and CLIP loaders expose an optional `compute_mode`:
+
+- `mixed`: development mode; the experimental path uses W4A4 for Q4_K/IQ3_S and INT8 for Q5_K/Q6_K/IQ3_XXS.
+- `int8`: development mode for supported GGUF Linear weights using INT8 Tensor Core operations.
+- `ggml` (default): uses the pinned ggml CUDA MMQ backend for Q1_0/Q2_0/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K–Q6_K, and IQ1_S/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS/IQ4_NL. It keeps the original GGUF packed weights and uses Q8_1 activations on RTX 3060. The plugin adds Q2_0 enum/size compatibility for gguf-py 0.19. The native extension must be built before selecting this mode.
+- `original`: use the existing dequantize-then-PyTorch path.
+
+The setting is per loader, so the diffusion model and text encoder can use different modes. New loader instances default to `ggml`; existing workflows keep any explicitly saved mode. `mixed` and `int8` dynamically quantize FP16, BF16, or FP32 activations; activation quantization can affect output quality. `ggml` converts bounded activation chunks to FP32 for the upstream MMQ entry, then quantizes them to Q8_1 internally. Unsupported per-layer shapes, patched weights, and unsupported operators use the original path. Selecting `ggml` with a missing or incompatible native extension currently reports an error: choose `original` manually in that case. Automatic fallback for an unavailable extension is planned, not implemented.
+
+### Building the ggml extension on Windows
+
+The known build environment is Windows x64, CPython 3.13, Torch `2.12.1+cu130`, CUDA Toolkit 13.5, MSVC, CMake, Ninja and an NVIDIA SM86 GPU. Other toolchain, Torch and GPU combinations have not been established as compatible. Use the Python that runs your ComfyUI; do not replace its Torch merely to build this plugin.
+
+1. Install Git, the CUDA Toolkit and Visual Studio C++ build tools, and make CMake and Ninja available on `PATH`. Set `CUDA_PATH` to the toolkit root. `vswhere` discovers Visual Studio, including prerelease installations. The toolkit/compiler combination must itself be compatible.
+2. Obtain a ggml Git checkout containing commit `d9fe7bff3d2bf4d077e25c654486d02c321734aa`. This repository does not currently include a ggml submodule; `third_party/ggml` is only the default expected path. Supply `--ggml-repo` if the checkout is elsewhere.
+3. From this plugin directory, run the build using your ComfyUI Python:
+
+```powershell
+& "<ComfyUI Python executable>" tools/build_native.py --ggml-repo "<ggml checkout>"
+```
+
+The script discovers Torch headers and import libraries from that Python. It also accepts `--cuda-root`, `--vs-root`, `--cmake`, `--ninja`, `--build-dir` and `--patched-source` when automatic discovery or the defaults do not fit. Use `--help` for details. The output is placed in `native/build`; restart ComfyUI to load a newly built extension.
+
+If the installed Torch lacks development files, extract them from a matching Torch wheel. The extractor's default SHA256 is for the local `torch-2.12.1+cu130-cp313-cp313-win_amd64.whl`; for another wheel, supply its independently verified `--sha256`. The wheel must match the active Torch version, Python and platform. The wrapper checks its SDK manifest; it does not install or replace Torch.
+
+```powershell
+& "<ComfyUI Python executable>" tools/extract_torch_sdk.py "<matching torch wheel>" "<SDK directory>" --sha256 "<wheel SHA256>"
+& "<ComfyUI Python executable>" tools/build_native.py --ggml-repo "<ggml checkout>" --torch-sdk "<SDK directory>\torch"
+```
+
+The build creates a detached worktree at the pinned ggml commit, applies the bridge there, builds SM86 and checks that the extension imports. It does not run a CUDA kernel. The legacy nine-argument `tools/build_ggml_backend.cmd` is still available. Build output is excluded from Git, and inference does not compile at runtime.
 
 LoRA loading is experimental but it should work with just the built-in LoRA loader node(s).
 
