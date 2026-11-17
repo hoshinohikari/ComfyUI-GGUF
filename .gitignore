@@ -10,6 +10,7 @@ __pycache__/
 
 # C extensions
 *.so
+native/build/
 
 # Distribution / packaging
 .Python
