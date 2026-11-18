@@ -97,7 +97,130 @@ def restore_minimax_image_metadata(state_dict, metadata):
     return {**metadata, "config": json.dumps(config)}
 
 
-def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False):
+_GGUF_GATE_UP_PAIR_RULES = (
+    ("gate_layer.weight", "proj.weight", "gate_up.weight"),
+)
+
+
+def combine_file_backed_gguf_gate_up(state_dict, file_ref, file_lock, mapped_bytes):
+    """Expose compatible adjacent packed gate/up rows as a zero-copy fused weight."""
+    from . import ggml_backend
+
+    combined_count = 0
+    candidate_count = 0
+    consumed = set()
+    discovered = 0
+    rejected = {}
+
+    def reject(reason):
+        rejected[reason] = rejected.get(reason, 0) + 1
+    for gate_suffix, up_suffix, fused_suffix in _GGUF_GATE_UP_PAIR_RULES:
+        for gate_key in tuple(state_dict):
+            if not gate_key.endswith(gate_suffix):
+                continue
+            discovered += 1
+            prefix = gate_key[:-len(gate_suffix)]
+            up_key = prefix + up_suffix
+            fused_key = prefix + fused_suffix
+            gate_bias_key = prefix + gate_suffix.removesuffix("weight") + "bias"
+            up_bias_key = prefix + up_suffix.removesuffix("weight") + "bias"
+            if (up_key not in state_dict or fused_key in state_dict or gate_key in consumed or up_key in consumed
+                    or gate_bias_key in state_dict or up_bias_key in state_dict):
+                reject("missing_partner_existing_target_bias_or_consumed")
+                continue
+
+            gate = state_dict[gate_key]
+            up = state_dict[up_key]
+            if not isinstance(gate, GGMLTensor) or not isinstance(up, GGMLTensor):
+                reject("not_ggml_tensor")
+                continue
+            qtype = getattr(gate, "tensor_type", None)
+            qtype_name = getattr(qtype, "name", "")
+            if qtype_name not in ggml_backend.GGML_MMQ_WEIGHT_TYPES or up.tensor_type != qtype:
+                reject("unsupported_or_mixed_qtype")
+                continue
+            gate_shape = tuple(getattr(gate, "tensor_shape", ()))
+            up_shape = tuple(getattr(up, "tensor_shape", ()))
+            if len(gate_shape) != 2 or gate_shape != up_shape or getattr(gate, "patches", []) or getattr(up, "patches", []):
+                reject("shape_or_patches")
+                continue
+
+            try:
+                block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
+            except KeyError:
+                reject("unknown_block_format")
+                continue
+            out_features, in_features = gate_shape
+            if in_features % block_size:
+                reject("unaligned_inner_dimension")
+                continue
+            expected_part_bytes = in_features // block_size * type_size * out_features
+            gate_storage = gate.untyped_storage()
+            up_storage = up.untyped_storage()
+            gate_slice = getattr(gate_storage, "_comfy_tensor_file_slice", None)
+            up_slice = getattr(up_storage, "_comfy_tensor_file_slice", None)
+            gate_refs = getattr(gate_storage, "_comfy_tensor_mmap_refs", None)
+            up_refs = getattr(up_storage, "_comfy_tensor_mmap_refs", None)
+            if (gate_slice is None or up_slice is None or gate_refs is None or up_refs is None
+                    or len(gate_refs) != 2 or len(up_refs) != 2
+                    or gate_slice.file_ref is not file_ref or up_slice.file_ref is not file_ref
+                    or gate_slice.lock is not file_lock or up_slice.lock is not file_lock
+                    or gate_refs[0] is None or gate_refs[0] is not up_refs[0] or gate_refs[1] is not up_refs[1]
+                    or not isinstance(gate_refs[1], memoryview)
+                    or gate_slice.size != expected_part_bytes or up_slice.size != expected_part_bytes
+                    or gate.numel() * gate.element_size() != expected_part_bytes
+                    or up.numel() * up.element_size() != expected_part_bytes
+                    or gate_slice.offset + gate_slice.size != up_slice.offset
+                    or gate.storage_offset() != 0 or up.storage_offset() != 0
+                    or not gate.is_contiguous() or not up.is_contiguous()
+                    or gate.dtype != up.dtype):
+                reject("nonadjacent_file_slices" if gate_slice is not None and up_slice is not None and gate_slice.offset + gate_slice.size != up_slice.offset else "file_storage_layout_incompatible")
+                continue
+
+            candidate_count += 1
+            start = gate_slice.offset
+            total_bytes = gate_slice.size + up_slice.size
+            end = start + total_bytes
+            if start < 0 or end > len(mapped_bytes):
+                reject("mapped_range_invalid")
+                continue
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="The given.*not writable")
+                combined_data = torch.frombuffer(mapped_bytes[start:end], dtype=gate.dtype)
+            combined_storage = combined_data.untyped_storage()
+            combined_storage._comfy_tensor_file_slice = comfy.memory_management.TensorFileSlice(
+                file_ref, file_lock, start, total_bytes,
+            )
+            combined_storage._comfy_tensor_mmap_refs = gate_refs
+            state_dict[fused_key] = GGMLTensor(
+                combined_data,
+                tensor_type=qtype,
+                tensor_shape=torch.Size((2 * out_features, in_features)),
+                patches=[],
+            )
+            del state_dict[gate_key]
+            del state_dict[up_key]
+            consumed.update((gate_key, up_key))
+            combined_count += 1
+
+    if candidate_count:
+        logging.info(
+            "ComfyUI-GGUF: zero-copy combined %d of %d compatible adjacent GGUF gate/up pairs; "
+            "other pairs retain the split model path",
+            combined_count,
+            candidate_count,
+        )
+    if ggml_backend.PERF_STATS_ENABLED:
+        from . import perf_diagnostics
+        perf_diagnostics.decision({
+            "gate_keys_discovered": discovered, "compatible_adjacent_pairs": candidate_count,
+            "combined_pairs": combined_count, "rejected": rejected,
+            "strategy": "combined_and_split" if combined_count else "split",
+        })
+    return combined_count
+
+
+def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=False, combine_gate_up=False):
     """
     Read state dict as fake tensors
     """
@@ -197,6 +320,9 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         # keep track of loaded tensor types
         tensor_type_str = getattr(tensor.tensor_type, "name", repr(tensor.tensor_type))
         qtype_dict[tensor_type_str] = qtype_dict.get(tensor_type_str, 0) + 1
+
+    if combine_gate_up and not is_text_model:
+        combine_file_backed_gguf_gate_up(state_dict, file_ref, file_lock, mapped_bytes)
 
     comfy.storage.annotate_state_dict(state_dict, path)
 

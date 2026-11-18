@@ -13,7 +13,11 @@ import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
-from .ops import make_gguf_ops, move_patch_to_device
+from .ops import (
+    install_qwen_image21_ggml_swiglu_dispatch,
+    make_gguf_ops,
+    move_patch_to_device,
+)
 from .loader import gguf_sd_loader, gguf_clip_loader
 from .dequant import is_quantized, is_torch_compatible
 
@@ -138,7 +142,8 @@ class UnetLoaderGGUF:
 
         # init model
         unet_path = folder_paths.get_full_path("unet", unet_name)
-        sd, extra = gguf_sd_loader(unet_path)
+        combine_gate_up = compute_mode == "ggml" and dequant_dtype in ("default", None)
+        sd, extra = gguf_sd_loader(unet_path, combine_gate_up=combine_gate_up)
 
         kwargs = {}
         valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
@@ -151,6 +156,8 @@ class UnetLoaderGGUF:
         if model is None:
             logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
             raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
+        if compute_mode == "ggml" and dequant_dtype in ("default", None):
+            install_qwen_image21_ggml_swiglu_dispatch(model.get_model_object("diffusion_model"))
         model = GGUFModelPatcher.clone(model)
         model.patch_on_device = patch_on_device
         return (model,)

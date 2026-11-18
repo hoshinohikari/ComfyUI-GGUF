@@ -1,9 +1,13 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
 import contextlib
+import itertools
 import gguf
 import torch
 import logging
 from dataclasses import dataclass
+import threading
+import weakref
+import types
 
 import comfy.ops
 import comfy.lora
@@ -11,6 +15,31 @@ import comfy.model_management
 from comfy.quant_ops import QuantizedTensor
 from comfy_kitchen.tensor import QuantizedLayout, register_layout_class
 from .dequant import GGUF_QUANTIZED_LAYOUT, dequantize, dequantize_tensor, is_quantized
+
+
+_GGUF_LAYOUT_OWNER_LOCK = threading.Lock()
+_GGUF_LAYOUT_OWNER_IDS = itertools.count(1)
+_GGUF_LAYOUT_OWNERS = weakref.WeakValueDictionary()
+
+
+def _register_gguf_layout_owner(module):
+    token = getattr(module, "_gguf_layout_owner_token", 0)
+    if token:
+        return token
+    with _GGUF_LAYOUT_OWNER_LOCK:
+        token = getattr(module, "_gguf_layout_owner_token", 0)
+        if not token:
+            token = next(_GGUF_LAYOUT_OWNER_IDS)
+            _GGUF_LAYOUT_OWNERS[token] = module
+            module._gguf_layout_owner_token = token
+    return token
+
+
+def _get_gguf_layout_owner(token):
+    if not token:
+        return None
+    with _GGUF_LAYOUT_OWNER_LOCK:
+        return _GGUF_LAYOUT_OWNERS.get(token)
 
 def chained_hasattr(obj, chained_attr):
     probe = obj
@@ -53,6 +82,8 @@ class GGUFQuantizedLayout(QuantizedLayout):
         orig_shape: tuple[int, ...]
         qtype: gguf.GGMLQuantizationType
         dequant_dtype: torch.dtype | str | None = None
+        compute_mode: str = "original"
+        owner_token: int = 0
 
         def to_device(self, device):
             return self
@@ -73,6 +104,68 @@ class GGUFQuantizedLayout(QuantizedLayout):
         dtype = params.orig_dtype if params.dequant_dtype == "target" else params.dequant_dtype
         result = dequantize(qdata, params.qtype, params.orig_shape, dtype=dtype)
         return result.to(params.orig_dtype)
+
+    @classmethod
+    @torch_compiler_disable()
+    def linear_input_act(cls, weight, x, bias=None, input_act=None, input_act_weight=None,
+                         input_act_eps=0.0, residual=None, residual_scale=None):
+        """Run Comfy's input activation semantics before a GGML quantized Linear."""
+        params = weight._params
+        qdata = weight._qdata
+        if params.compute_mode != "ggml":
+            return NotImplemented
+        try:
+            from . import ggml_backend
+            from comfy.ops import _eager_input_act, _linear_residual
+        except ImportError:
+            return NotImplemented
+
+        qtype_name = getattr(params.qtype, "name", "unknown")
+        out_features = int(params.orig_shape[0]) if params.orig_shape else 0
+
+        def unsupported(reason):
+            ggml_backend.record_perf_fallback(qtype_name, x, out_features, f"linear_input_act: {reason}")
+            ggml_backend.warn_once((qtype_name, "linear_input_act", reason), reason)
+            return NotImplemented
+
+        owner = _get_gguf_layout_owner(params.owner_token)
+        if (params.dequant_dtype is not None or params.owner_token == 0 or owner is None
+                or len(params.orig_shape) != 2 or x.requires_grad
+                or x.device.type != "cuda" or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+                or qdata.device != x.device or not qdata.is_contiguous()):
+            return unsupported("activation layout, dtype, device, or weight layout is unsupported")
+        if (getattr(owner, "gguf_compute_mode", "original") != "ggml"
+                or getattr(owner, "_full_precision_mm", False)
+                or getattr(owner, "comfy_force_cast_weights", False)
+                or getattr(owner, "comfy_force_forward", False)
+                or getattr(owner, "weight_function", [])
+                or getattr(owner, "bias_function", [])):
+            return unsupported("module state requires the existing cast, hook, or full-precision path")
+        if comfy.model_management.in_training:
+            return unsupported("training mode is unsupported")
+
+        if qtype_name not in ggml_backend.SUPPORTED_WEIGHT_TYPES:
+            return unsupported(f"unsupported quantization type {qtype_name}")
+        activated = _eager_input_act(x, input_act, input_act_weight, input_act_eps)
+        out_features, in_features = (int(v) for v in params.orig_shape)
+        if activated.shape[-1] != in_features or out_features <= 0:
+            return unsupported("activated input K dimension does not match the GGUF Linear weight")
+
+        try:
+            input_2d = activated.reshape(-1, in_features).contiguous()
+            ggml_backend.ensure_device(input_2d.device)
+            output = ggml_backend.linear_mmq(qdata, input_2d, out_features, int(params.qtype))
+        except ggml_backend.GGMLMMQUnsupported as exc:
+            return unsupported(str(exc))
+
+        output = output.reshape(*activated.shape[:-1], out_features)
+        if bias is not None:
+            output = output + bias
+        ggml_backend.info_once(
+            (qtype_name, str(input_2d.device), str(input_2d.dtype), "linear_input_act", input_act),
+            f"ggml MMQ linear_input_act {qtype_name}, activation={input_act}, input={input_2d.dtype}, device={input_2d.device}",
+        )
+        return _linear_residual(output, residual, residual_scale)
 
     @classmethod
     def get_plain_tensors(cls, qtensor):
@@ -107,17 +200,182 @@ class GGUFQuantizedLayout(QuantizedLayout):
 register_layout_class(GGUF_QUANTIZED_LAYOUT, GGUFQuantizedLayout)
 
 
+@torch_compiler_disable()
+def _try_ggml_fused_swiglu(gate_layer, up_layer, x):
+    """Run split QwenImage21 GGUF projections through the dual-weight MMQ API."""
+    from . import ggml_backend
+
+    def unsupported(reason):
+        weight = getattr(gate_layer, "weight", None)
+        params = getattr(weight, "_params", None)
+        qtype = getattr(getattr(params, "qtype", None), "name", "unknown")
+        output_features = int(getattr(gate_layer, "out_features", 0))
+        if isinstance(x, torch.Tensor) and x.ndim:
+            ggml_backend.record_perf_fallback(qtype, x, output_features, f"fused_swiglu: {reason}")
+        ggml_backend.warn_once(
+            (qtype, "fused_swiglu", reason),
+            f"fused GGML SwiGLU fallback: {reason}",
+        )
+        return None
+
+    if (not isinstance(x, torch.Tensor) or x.ndim < 2 or x.requires_grad
+            or x.device.type != "cuda"
+            or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or not x.is_contiguous()):
+        return unsupported("activation layout, dtype, device, or gradient state is unsupported")
+    if comfy.model_management.in_training:
+        return unsupported("training mode is unsupported")
+
+    layers = (gate_layer, up_layer)
+    params = []
+    qtype_ids = []
+    for layer in layers:
+        weight = getattr(layer, "weight", None)
+        if not is_gguf_quantized_tensor(weight):
+            return unsupported("gate and up must both use packed GGUF weights")
+        weight_params = weight._params
+        owner = _get_gguf_layout_owner(weight_params.owner_token)
+        if (weight_params.compute_mode != "ggml" or weight_params.dequant_dtype is not None
+                or owner is None or getattr(layer, "gguf_compute_mode", "original") != "ggml"):
+            return unsupported("GGUF weight is not configured for default GGML execution")
+        if (getattr(layer, "bias", None) is not None
+                or getattr(layer, "weight_function", [])
+                or getattr(layer, "bias_function", [])
+                or getattr(layer, "comfy_force_cast_weights", False)
+                or getattr(layer, "comfy_force_forward", False)
+                or getattr(layer, "_full_precision_mm", False)
+                or getattr(layer, "_forward_hooks", {})
+                or getattr(layer, "_forward_pre_hooks", {})):
+            return unsupported("bias, patch, hook, or forced cast requires the split path")
+        if len(weight_params.orig_shape) != 2:
+            return unsupported("gate and up weights must be matrices")
+        params.append(weight_params)
+        qtype_ids.append(int(weight_params.qtype))
+
+    gate_shape = tuple(int(v) for v in params[0].orig_shape)
+    up_shape = tuple(int(v) for v in params[1].orig_shape)
+    if (gate_shape != up_shape or gate_shape[1] != int(gate_layer.in_features)
+            or int(up_layer.in_features) != int(gate_layer.in_features)):
+        return unsupported("gate and up matrix shapes must match the Linear modules")
+    qtype_name = getattr(params[0].qtype, "name", "")
+    if (qtype_ids[0] != qtype_ids[1]
+            or qtype_name not in ggml_backend.GGML_MMQ_FUSION_WEIGHT_TYPES):
+        return unsupported(f"GGML fused MMQ does not support gate/up format {qtype_name or 'unknown'}")
+    if x.shape[-1] != gate_shape[1]:
+        return unsupported("activation K dimension does not match the gate/up weights")
+
+    try:
+        with contextlib.ExitStack() as stack:
+            casted = []
+            for layer in layers:
+                packed, bias = stack.enter_context(
+                    comfy.ops.CastBiasWeightContext(
+                        layer,
+                        input=None,
+                        dtype=layer.weight.dtype,
+                        device=x.device,
+                        bias_dtype=x.dtype,
+                        offloadable=True,
+                    )
+                )
+                if bias is not None or not is_gguf_quantized_tensor(packed):
+                    return unsupported("ComfyUI cast did not preserve packed GGUF weights")
+                qdata = packed._qdata
+                if qdata.device != x.device or not qdata.is_contiguous():
+                    return unsupported("packed gate/up weights are not contiguous on the execution device")
+                casted.append(qdata)
+
+            # Some offload configurations reuse one scratch buffer for multiple casts.
+            gate_ptr, up_ptr = (weight.data_ptr() for weight in casted)
+            gate_bytes, up_bytes = (weight.numel() * weight.element_size() for weight in casted)
+            if gate_ptr < up_ptr + up_bytes and up_ptr < gate_ptr + gate_bytes:
+                return unsupported("gate and up casts overlap in the offload buffer")
+
+            input_features = gate_shape[1]
+            output_features = gate_shape[0]
+            input_2d = x.reshape(-1, input_features).contiguous()
+            ggml_backend.ensure_device(x.device)
+            return ggml_backend.linear_glu_mmq(
+                casted[1],
+                casted[0],
+                input_2d,
+                output_features,
+                qtype_ids[1],
+                qtype_ids[0],
+                "SWIGLU",
+            )
+    except ggml_backend.GGMLMMQUnsupported as exc:
+        return unsupported(str(exc))
+    except (AttributeError, IndexError, TypeError) as exc:
+        return unsupported(f"GGUF cast or tensor layout is unsupported: {exc}")
+
+
+def _qwen_image21_ggml_swiglu_forward(self, x):
+    if not self.fused:
+        activated = _try_ggml_fused_swiglu(self.gate_layer, self.proj, x)
+        if activated is not None:
+            activated = activated.reshape(*x.shape[:-1], self.out.in_features)
+            return self.out(activated)
+    return self._gguf_original_forward(self, x)
+
+
+def install_qwen_image21_ggml_swiglu_dispatch(diffusion_model):
+    """Install instance-local fused dispatch for split QwenImage21 GGML blocks."""
+    from . import ggml_backend
+
+    try:
+        from comfy.ldm.qwen_image21.model import SwiGLUFeedForward
+    except ImportError:
+        return 0
+
+    if not isinstance(diffusion_model, torch.nn.Module):
+        return 0
+
+    installed = 0
+    for module in diffusion_model.modules():
+        if (not isinstance(module, SwiGLUFeedForward) or module.fused
+                or getattr(module, "_gguf_swiglu_dispatch_installed", False)):
+            continue
+        if not all(
+            getattr(layer, "gguf_compute_mode", "original") == "ggml"
+            for layer in (module.gate_layer, module.proj, module.out)
+        ):
+            continue
+        if (not is_gguf_quantized_tensor(module.gate_layer.weight)
+                or not is_gguf_quantized_tensor(module.proj.weight)):
+            continue
+        gate_params = module.gate_layer.weight._params
+        up_params = module.proj.weight._params
+        if (gate_params.dequant_dtype is not None or up_params.dequant_dtype is not None
+                or gate_params.compute_mode != "ggml" or up_params.compute_mode != "ggml"
+                or gate_params.qtype != up_params.qtype
+                or getattr(gate_params.qtype, "name", "") not in ggml_backend.GGML_MMQ_FUSION_WEIGHT_TYPES):
+            continue
+        module._gguf_original_forward = SwiGLUFeedForward.forward
+        module.forward = types.MethodType(_qwen_image21_ggml_swiglu_forward, module)
+        module._gguf_swiglu_dispatch_installed = True
+        installed += 1
+    if installed:
+        logging.info(
+            "ComfyUI-GGUF: installed dual-weight GGML SwiGLU dispatch on %d QwenImage21 blocks",
+            installed,
+        )
+    return installed
+
+
 def is_gguf_quantized_tensor(tensor):
     return isinstance(tensor, QuantizedTensor) and tensor._layout_cls == GGUF_QUANTIZED_LAYOUT
 
 
-def make_gguf_quantized_tensor(tensor, dtype, dequant_dtype=None):
+def make_gguf_quantized_tensor(tensor, dtype, dequant_dtype=None, compute_mode="original", owner_token=0):
     qdata = tensor.as_subclass(torch.Tensor)
     params = GGUFQuantizedLayout.Params(
         orig_dtype=dtype,
         orig_shape=tuple(tensor.tensor_shape),
         qtype=tensor.tensor_type,
         dequant_dtype=dequant_dtype,
+        compute_mode=compute_mode,
+        owner_token=owner_token,
     )
     return QuantizedTensor(qdata, GGUF_QUANTIZED_LAYOUT, params)
 
@@ -203,12 +461,18 @@ class GGMLLayer(torch.nn.Module):
             if k[prefix_len:] == "weight":
                 if isinstance(v, GGMLTensor) and is_quantized(v):
                     dtype = getattr(self, "weight_comfy_model_dtype", None) or torch.float16
-                    v = make_gguf_quantized_tensor(v, dtype, self.dequant_dtype)
+                    owner_token = _register_gguf_layout_owner(self)
+                    v = make_gguf_quantized_tensor(
+                        v, dtype, self.dequant_dtype, getattr(self, "gguf_compute_mode", "original"), owner_token
+                    )
                 self.weight = torch.nn.Parameter(v, requires_grad=False)
             elif k[prefix_len:] == "bias" and v is not None:
                 if isinstance(v, GGMLTensor) and is_quantized(v):
                     dtype = getattr(self, "bias_comfy_model_dtype", None) or torch.float16
-                    v = make_gguf_quantized_tensor(v, dtype, self.dequant_dtype)
+                    owner_token = _register_gguf_layout_owner(self)
+                    v = make_gguf_quantized_tensor(
+                        v, dtype, self.dequant_dtype, getattr(self, "gguf_compute_mode", "original"), owner_token
+                    )
                 self.bias = torch.nn.Parameter(v, requires_grad=False)
             else:
                 unexpected_keys.append(k)
@@ -379,19 +643,19 @@ class GGMLOps(comfy.ops.manual_cast):
             if not is_gguf_quantized_tensor(self.weight):
                 return None
             if getattr(self, "dequant_dtype", None) is not None:
-                self._warn_ggml_fallback("explicit dequant_dtype requires the original compute path")
+                self._warn_ggml_fallback("explicit dequant_dtype requires the original compute path", input)
                 return None
             if getattr(self, "comfy_force_cast_weights", False):
-                self._warn_ggml_fallback("ComfyUI forced weight casting")
+                self._warn_ggml_fallback("ComfyUI forced weight casting", input)
                 return None
             if getattr(self, "weight_function", []) or getattr(self, "bias_function", []):
-                self._warn_ggml_fallback("LoRA or weight hooks are active")
+                self._warn_ggml_fallback("LoRA or weight hooks are active", input)
                 return None
             if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-                self._warn_ggml_fallback(f"unsupported activation dtype {input.dtype}")
+                self._warn_ggml_fallback(f"unsupported activation dtype {input.dtype}", input)
                 return None
             if input.device.type != "cuda":
-                self._warn_ggml_fallback(f"unsupported execution device {input.device}")
+                self._warn_ggml_fallback(f"unsupported execution device {input.device}", input)
                 return None
 
             try:
@@ -401,20 +665,20 @@ class GGMLOps(comfy.ops.manual_cast):
                 qtype = self.weight._params.qtype
                 qtype_name = getattr(qtype, "name", "")
                 if qtype_name not in ggml_backend.SUPPORTED_WEIGHT_TYPES:
-                    self._warn_ggml_fallback(f"unsupported quantization type {qtype_name or 'unknown'}")
+                    self._warn_ggml_fallback(f"unsupported quantization type {qtype_name or 'unknown'}", input)
                     return None
                 qtype_id = int(getattr(qtype, "value", qtype))
             except (AttributeError, TypeError, ValueError) as exc:
-                self._warn_ggml_fallback(f"invalid GGUF quantization metadata: {exc}")
+                self._warn_ggml_fallback(f"invalid GGUF quantization metadata: {exc}", input)
                 return None
 
             in_features = int(self.in_features)
             out_features = int(self.out_features)
             if tuple(self.weight._params.orig_shape) != (out_features, in_features):
-                self._warn_ggml_fallback("GGUF matrix shape does not match the Linear module")
+                self._warn_ggml_fallback("GGUF matrix shape does not match the Linear module", input)
                 return None
             if input.shape[-1] != in_features or not input.is_contiguous():
-                self._warn_ggml_fallback("activation layout or K dimension is unsupported")
+                self._warn_ggml_fallback("activation layout or K dimension is unsupported", input)
                 return None
 
             try:
@@ -427,18 +691,18 @@ class GGMLOps(comfy.ops.manual_cast):
                     offloadable=True,
                 ) as (weight, bias):
                     if not is_gguf_quantized_tensor(weight):
-                        self._warn_ggml_fallback("ComfyUI cast did not preserve the packed GGUF tensor")
+                        self._warn_ggml_fallback("ComfyUI cast did not preserve the packed GGUF tensor", input)
                         return None
                     qdata = weight._qdata
                     if qdata.device != input.device or not qdata.is_contiguous():
-                        self._warn_ggml_fallback("packed GGUF weights are not contiguous on the execution device")
+                        self._warn_ggml_fallback("packed GGUF weights are not contiguous on the execution device", input)
                         return None
 
                     input_2d = input.view(-1, in_features)
                     try:
                         output_2d = ggml_backend.linear_mmq(qdata, input_2d, out_features, qtype_id)
                     except ggml_backend.GGMLMMQUnsupported as exc:
-                        self._warn_ggml_fallback(str(exc))
+                        self._warn_ggml_fallback(str(exc), input)
                         return None
                     if bias is not None:
                         output_2d.add_(bias)
@@ -450,15 +714,17 @@ class GGMLOps(comfy.ops.manual_cast):
                     )
                     return output
             except (AttributeError, IndexError, TypeError) as exc:
-                self._warn_ggml_fallback(f"GGUF layout is unsupported: {exc}")
+                self._warn_ggml_fallback(f"GGUF layout is unsupported: {exc}", input)
                 return None
 
-        def _warn_ggml_fallback(self, reason):
+        def _warn_ggml_fallback(self, reason, input=None):
             try:
                 from . import ggml_backend
 
                 qtype = getattr(getattr(getattr(self, "weight", None), "_params", None), "qtype", None)
                 qtype_name = getattr(qtype, "name", "unknown")
+                if input is not None:
+                    ggml_backend.record_perf_fallback(qtype_name, input, self.out_features, reason)
                 ggml_backend.warn_once((qtype_name, reason), reason)
             except ImportError:
                 logging.warning("ComfyUI-GGUF ggml MMQ fallback: %s", reason)
