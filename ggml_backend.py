@@ -72,6 +72,9 @@ def record_perf_fallback(qtype: str, input_tensor: torch.Tensor, output_features
 
 
 def reset_perf_stats() -> dict[str, Any]:
+    if PERF_STATS_ENABLED:
+        from . import perf_diagnostics
+        perf_diagnostics.reset()
     with _perf_lock:
         _perf_fallbacks.clear()
     module = _module
@@ -111,6 +114,9 @@ def collect_perf_stats() -> dict[str, Any]:
               "timing_samples_per_shape_limit": native.get("timing_samples_per_shape_limit", 3),
               "dropped_event_pairs": native.get("dropped_event_pairs", 0),
               "gpu_synchronized_devices": native.get("gpu_synchronized_devices", 0)}
+    if PERF_STATS_ENABLED:
+        from . import perf_diagnostics
+        report["diagnostics"] = perf_diagnostics.collect()
     logging.info("ComfyUI-GGUF MMQ performance report: %s", json.dumps(report, sort_keys=True, separators=(",", ":")))
     return report
 

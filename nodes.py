@@ -360,3 +360,10 @@ def _register_ggml_perf_routes():
 
 
 _register_ggml_perf_routes()
+
+
+# Optional host-boundary wrappers; no hooks are installed with profiling disabled.
+from . import ggml_backend as _perf_backend
+if _perf_backend.PERF_STATS_ENABLED:
+    from . import perf_diagnostics
+    perf_diagnostics.install()
