@@ -327,3 +327,36 @@ NODE_CLASS_MAPPINGS = {
     "UnetLoaderGGUFAdvanced": UnetLoaderGGUFAdvanced,
 }
 
+
+def _register_ggml_perf_routes():
+    try:
+        from aiohttp import web
+        from server import PromptServer
+        server = PromptServer.instance
+        if server is None or getattr(server, "_comfyui_gguf_perf_routes_registered", False):
+            return
+
+        @server.routes.post("/gguf/perf/reset")
+        async def gguf_perf_reset(request):
+            from . import ggml_backend
+            if not ggml_backend.PERF_STATS_ENABLED:
+                return web.json_response({"enabled": False, "reason": "Set COMFYUI_GGUF_PERF_STATS=1 and restart ComfyUI"}, status=409)
+            return web.json_response(ggml_backend.reset_perf_stats())
+
+        @server.routes.post("/gguf/perf/report")
+        async def gguf_perf_report(request):
+            from . import ggml_backend
+            if not ggml_backend.PERF_STATS_ENABLED:
+                return web.json_response({"enabled": False, "reason": "Set COMFYUI_GGUF_PERF_STATS=1 and restart ComfyUI"}, status=409)
+            try:
+                return web.json_response(ggml_backend.collect_perf_stats())
+            except Exception as exc:
+                logging.exception("ComfyUI-GGUF failed to collect performance stats")
+                return web.json_response({"enabled": True, "error": str(exc)}, status=500)
+
+        server._comfyui_gguf_perf_routes_registered = True
+    except Exception:
+        logging.exception("ComfyUI-GGUF failed to register optional performance statistics routes")
+
+
+_register_ggml_perf_routes()

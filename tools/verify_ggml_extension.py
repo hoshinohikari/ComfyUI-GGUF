@@ -26,8 +26,22 @@ def main() -> None:
         raise RuntimeError(f"Cannot create an import spec for {binaries[0]}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if not callable(getattr(module, "collect_performance_stats", None)) or not callable(
+        getattr(module, "reset_performance_stats", None)
+    ):
+        raise RuntimeError("Native extension does not expose the optional profiling API; rebuild the extension")
+    if not callable(getattr(module, "linear_glu_mmq", None)) or not hasattr(module, "GGMLGluOp"):
+        raise RuntimeError("Native extension does not expose the fused gate/up MMQ API; rebuild the extension")
 
     info = module.build_info()
+    if info.get("fusion_api_version") != 1:
+        raise RuntimeError("Native extension fused gate/up API version does not match this source")
+    if tuple(info.get("fusion_weight_types", ())) != ("Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ4_XS"):
+        raise RuntimeError("Native extension fused weight types do not match this source")
+    if tuple(info.get("fusion_glu_ops", ())) != ("GEGLU", "SWIGLU", "SWIGLU_OAI", "SWIGLU_CLAMP"):
+        raise RuntimeError("Native extension fused GLU operations do not match this source")
+    if any(not hasattr(module.GGMLGluOp, name) for name in info["fusion_glu_ops"]):
+        raise RuntimeError("Native extension is missing a fused GLU enum value")
     expected_archs = sorted(int(a) for a in args.cuda_archs.replace(",", ";").split(";"))
     if sorted(info.get("cuda_archs", [])) != expected_archs:
         raise RuntimeError("Native extension architecture list does not match this build")
